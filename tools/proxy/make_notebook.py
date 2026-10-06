@@ -41,7 +41,10 @@ so use `QUICK = True` there). Then Runtime → **Run all**.
 Each run appends to a results file, and **re-running skips finished runs**, so a disconnect loses at most one run.
 Round 1 takes about an hour on an A100 (about 40 min on an H100); round 2 adds 15-30 min.
 
-**When it finishes, copy the last cell's output (the summary) back to Claude.**
+**Two GPUs?** Open a second copy of this notebook on the other GPU and set `FIRST_SEED = 2` there. It runs
+different seeds of the same variants, so the two summaries together give twice the seeds in the same wall time.
+
+**When it finishes, copy the last cell's output (the summary) back to Claude**, from each copy if you ran two.
 
 A proxy win is a screen, not proof: the record is ~124M params plus an 84.6M-row n-gram table trained on ~330M
 tokens. Ideas that win here, especially in round 2, are the ones worth 8xH100 time.
@@ -54,6 +57,7 @@ code('''
 code('''
 # 2. Settings
 SEEDS = 2           # seeds per variant: seed noise at this scale is a few millinats, so keep >= 2
+FIRST_SEED = 0      # a second copy on another GPU: set 2 here so it runs seeds 2 and 3
 QUICK = False       # True: 1 seed and 600 steps per run, a ~20-minute first look (noisier). Use on a T4.
 DATA_DIR = "/content/fineweb10B"
 RESULTS_FILE = "/content/proxy_results.jsonl"  # every finished run is appended; re-running skips them
@@ -106,7 +110,7 @@ def run(names, seeds, base):
     done = load_results()
     results = {}
     for name in names:
-        for seed in range(seeds):
+        for seed in range(FIRST_SEED, FIRST_SEED + seeds):
             cfg = base.update(**combine(name), seed=seed)
             key = run_key(name, seed, cfg)
             if key not in done:
@@ -174,14 +178,19 @@ else:
 code('''
 # 8. Summary: copy this whole output back to Claude.
 summary = {"gpu": torch.cuda.get_device_name() if torch.cuda.is_available() else "cpu", "seeds": SEEDS,
+           "first_seed": FIRST_SEED,
            "steps": BASE.steps, "runs": {}}
 for res in (round1, round2):
     for name, rs in res.items():
         vals = [r["val_loss"] for r in rs]
         summary["runs"][name] = {"n": len(vals), "val": round(statistics.mean(vals), 5),
+                                 "vals": [round(v, 5) for v in vals],
                                  "sd": round(statistics.stdev(vals), 5) if len(vals) > 1 else None,
                                  "seconds": round(statistics.mean(r["seconds"] for r in rs), 1)}
-print(json.dumps(summary, indent=1))
+runs = summary.pop("runs")
+print("{" + json.dumps(summary)[1:-1] + ', "runs": {')
+print(",\\n".join(f"  {json.dumps(k)}: {json.dumps(v)}" for k, v in runs.items()))
+print("}}")
 '''),
 ]
 nb = {"nbformat": 4, "nbformat_minor": 5,

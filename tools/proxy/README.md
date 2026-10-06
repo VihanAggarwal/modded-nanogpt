@@ -8,7 +8,8 @@ and from seed noise. Ideas that win clearly here go to the 8xH100 sweep (`tools/
 **Easiest:** upload `nanogpt_proxy_screen.ipynb` to Colab (File → Upload notebook), pick an A100 or H100 runtime
 and Run all. It is self-contained: the code is inline, and the data comes from Hugging Face. It screens the
 record's own techniques as calibration, plus the new candidates, then re-tests the winners on a stack of the
-calibration winners. Regenerate it after editing `proxy_gpt.py` with the notebook builder.
+calibration winners. With two GPUs, run a second copy with `FIRST_SEED = 2` for twice the seeds in the same
+time. Regenerate it after editing `proxy_gpt.py` with the notebook builder.
 
 Or, from a clone, in a Colab notebook with an A100, L4 or H100 runtime (a T4 works but is ~10x slower):
 
