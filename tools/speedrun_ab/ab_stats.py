@@ -26,6 +26,11 @@ import statistics
 from dataclasses import dataclass, field
 
 GATE = 3.28
+# Loss-adjusted wall: the record's own exchange rate between val loss and wall time (ANVIL2 README: 164 ms per
+# millinat, the marginal cost of buying val with extra steps), and the val a record is kept at (~2.5 millinats
+# below the gate). Compares variants that land at different losses: wall + rate * (val - target).
+MS_PER_MILLINAT = 164.0
+TARGET_VAL = 3.2775
 STEP_RE = re.compile(r"^step:(\d+)/(\d+) (?:val_loss:([\d.]+) )?train_time:(\d+)ms")
 
 
@@ -200,11 +205,54 @@ def report(baseline: list[Run], candidate: list[Run]) -> str:
     return "\n".join(lines)
 
 
+def adjusted_wall(runs: list[Run]) -> float:
+    """Mean wall (s) at TARGET_VAL: each millinat of val above it costs MS_PER_MILLINAT."""
+    val = statistics.mean(r.val_loss for r in runs)
+    return statistics.mean(r.wall_ms for r in runs) / 1000 + MS_PER_MILLINAT / 1000 * (val - TARGET_VAL) * 1000
+
+
+def report_many(arms: dict[str, list[Run]]) -> str:
+    """One row per arm against the first: the sweep view (variants, step counts)."""
+    names = list(arms)
+    base = arms[names[0]]
+    lines = [f"{'arm':>24} {'n':>3} {'steps':>6} {'wall s':>15} {'val':>17} {'p(val<3.28)':>11} {'d wall ms':>10} "
+             f"{'adj wall s':>10} {'d adj ms':>9}",
+             "(adj wall = wall + 164 ms per millinat of mean val above 3.2775: variants compared at equal loss)"]
+    for name in names:
+        runs = arms[name]
+        if not runs:
+            lines.append(f"{name:>24}   0  (no finished run)")
+            continue
+        walls = [r.wall_ms / 1000 for r in runs]
+        vals = [r.val_loss for r in runs]
+        steps = "/".join(sorted({str(r.total_steps) for r in runs}))
+        sd = lambda xs: statistics.stdev(xs) if len(xs) > 1 else float("nan")
+        p = one_sample_less(vals, GATE)[1] if len(vals) > 1 else float("nan")
+        d_wall = 1000 * (statistics.mean(walls) - statistics.mean(r.wall_ms / 1000 for r in base)) if base else float("nan")
+        adj = adjusted_wall(runs)
+        d_adj = 1000 * (adj - adjusted_wall(base)) if base else float("nan")
+        lines.append(f"{name:>24} {len(runs):>3} {steps:>6} {statistics.mean(walls):7.3f}+/-{sd(walls):5.3f} "
+                     f"{statistics.mean(vals):.5f}+/-{sd(vals):.5f} {p:11.3g} {d_wall:+10.0f} {adj:10.3f} {d_adj:+9.0f}")
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--baseline", required=True, help="glob of the baseline arm's run logs")
-    parser.add_argument("--candidate", required=True, help="glob of the candidate arm's run logs")
+    parser.add_argument("--baseline", help="glob of the baseline arm's run logs")
+    parser.add_argument("--candidate", help="glob of the candidate arm's run logs")
+    parser.add_argument("--arm", action="append", default=[], metavar="NAME=GLOB",
+                        help="sweep mode: one per arm, the first is the baseline")
     args = parser.parse_args()
+    if args.arm:
+        arms, bad = {}, []
+        for spec in args.arm:
+            name, _, pattern = spec.partition("=")
+            arms[name], unfinished = load(pattern)
+            bad += unfinished
+        for path in bad:
+            print(f"NOTE: no final validation in {path} (crashed or unfinished run); all runs count, so investigate it")
+        print(report_many(arms))
+        return
     baseline, b_bad = load(args.baseline)
     candidate, c_bad = load(args.candidate)
     for path in b_bad + c_bad:

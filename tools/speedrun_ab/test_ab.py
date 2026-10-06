@@ -110,3 +110,26 @@ def test_interval_table_localizes_a_gain():
     first = next(line for line in report.splitlines() if line.strip().startswith("0-25"))
     assert float(first.split()[-1]) < -140
     assert "100-val" in report
+
+
+def test_sweep_arms_share_a_checkout_with_their_own_env(tmp_path):
+    arm = tmp_path / "arm"
+    arm.mkdir()
+    (arm / "fake.py").write_text(FAKE_TRAINER)
+    (arm / "run.sh").write_text(f"{sys.executable} fake.py\n")
+    out = tmp_path / "out"
+    cmd = [sys.executable, str(Path(ab_bench.__file__)), "--legs", "3", "--out", str(out), "--command", "bash run.sh"]
+    for name, step_ms in (("base", "10"), ("faster", "9"), ("slower", "11")):
+        cmd += ["--arm", f"{name}={arm}", "--arm-env", f"{name}:FAKE_STEP_MS={step_ms}"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    rows = {line.split()[0]: line.split() for line in (out / "report.txt").read_text().splitlines()
+            if line.split() and line.split()[0] in ("base", "faster", "slower")}
+    d_wall = {name: float(row[6]) for name, row in rows.items()}
+    assert d_wall["base"] == 0 and abs(d_wall["faster"] + 100) < 6 and abs(d_wall["slower"] - 100) < 6, rows
+
+
+def test_adjusted_wall_prices_val_at_the_record_rate():
+    run = lambda wall_s, val: ab_stats.Run("x", 100, int(wall_s * 1000), val, {})
+    # 2 millinats above the target cost 2 * 164 ms.
+    assert abs(ab_stats.adjusted_wall([run(40.0, 3.2795)]) - 40.328) < 1e-9

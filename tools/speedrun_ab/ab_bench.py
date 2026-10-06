@@ -102,6 +102,8 @@ def main():
     parser.add_argument("--out", required=True, help="directory for stdout, logs and the ledger")
     parser.add_argument("--cold", action="store_true", help="empty compile caches for every leg")
     parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE", help="extra environment for every leg")
+    parser.add_argument("--arm-env", action="append", default=[], metavar="NAME:KEY=VALUE",
+                        help="environment for one arm's legs (e.g. a step count); arms may share a directory")
     parser.add_argument("--nproc", type=int, default=8)
     parser.add_argument("--command", default=DEFAULT_COMMAND, help="leg command, run in the arm's directory")
     parser.add_argument("--data-path", default=None, help="DATA_PATH both arms read (default: each arm's own data/)")
@@ -114,6 +116,12 @@ def main():
         arm_dirs[name] = Path(path).resolve()
         assert (arm_dirs[name] / "train_gpt.py").exists() or args.command != DEFAULT_COMMAND, f"no train_gpt.py in {path}"
     env = dict(kv.split("=", 1) for kv in args.env)
+    arm_env = {name: {} for name in arm_dirs}
+    for spec in args.arm_env:
+        name, _, kv = spec.partition(":")
+        assert name in arm_env, f"--arm-env for unknown arm {name}"
+        key, _, value = kv.partition("=")
+        arm_env[name][key] = value
     if args.data_path:
         env["DATA_PATH"] = str(Path(args.data_path).resolve())
     command = args.command.format(nproc=args.nproc)
@@ -122,6 +130,9 @@ def main():
     for note in preflight(arm_dirs, args.data_path):
         print(f"PREFLIGHT: {note}")
     print(f"{len(order)} legs: {' '.join(order)}\ncommand: {command}\nenv: {env}  cold caches: {args.cold}")
+    for name, extra in arm_env.items():
+        if extra:
+            print(f"  {name}: {extra}")
     if args.dry_run:
         return
 
@@ -129,14 +140,18 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     with open(out / "ledger.jsonl", "a") as ledger:
         for index, arm in enumerate(order):
-            record = run_leg(index, arm, arm_dirs[arm], command, env, out, args.cold)
+            record = run_leg(index, arm, arm_dirs[arm], command, {**env, **arm_env[arm]}, out, args.cold)
             ledger.write(json.dumps(record) + "\n")
             ledger.flush()
             print(f"leg {index:3d} {arm:>10}: exit {record['exit_code']}  wall {record['wall_ms']} ms  "
                   f"val {record['val_loss']}  ({record['seconds']} s with compile)", flush=True)
 
     names = list(arm_dirs)
-    if len(names) >= 2:
+    if len(names) > 2:
+        report = ab_stats.report_many({name: ab_stats.load(str(out / name / "*.txt"))[0] for name in names})
+        (out / "report.txt").write_text(report + "\n")
+        print(report)
+    elif len(names) == 2:
         baseline, _ = ab_stats.load(str(out / names[0] / "*.txt"))
         candidate, _ = ab_stats.load(str(out / names[1] / "*.txt"))
         if len(baseline) >= 2 and len(candidate) >= 2:
