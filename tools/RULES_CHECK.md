@@ -20,6 +20,15 @@ t0 there are only allocations and thread/process setup, the same kind the record
 clock: pinned staging, the prep thread, `cudaHostRegister` of the mask buffer. That includes the mask
 builder's interpreter check. The builder process itself is spawned on the clock, at step 25.
 
+## Open items in the incorporated PRs
+
+- #375 builds its token-normalization map (`token_norm.py`, ~70 ms) at import, before the clock. The record's
+  convention puts tokenizer-derived tables on the clock (the prefix table, the canonical mask). Only the
+  tokenizer's own download and parse happen before it. A reviewer may ask for the map's build to move onto the
+  clock; that is a follow-up here.
+- #379's eval mixture uses `-log(p + 1e-9)`, which is normalized to within 5e-5 nats (disclosed in #379).
+  Its 8192-token eval copy band was chosen on val, like any other eval hyperparameter.
+
 ## Checklist for new ideas
 
 1. Same token stream into training and validation, batch for batch? (Different batch size, sequence
