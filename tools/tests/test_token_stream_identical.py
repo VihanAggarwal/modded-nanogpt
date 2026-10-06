@@ -1,5 +1,5 @@
 """Rule 1 check: the loader of this branch yields byte-identical batches to the record's (upstream 4ea6b93)
-for every step of the timed run's schedule, and for the validation.
+for every step of the record's schedule and the stack's, and for the validation.
 
 Run from the repo root: python -m pytest tools/tests -q
 Uses FineWeb-format shards under $SPEEDRUN_TEST_DATA/data/fineweb10B (real or synthetic; the full
@@ -89,7 +89,8 @@ def test_numpy_bos_indexes_equal_torch_nonzero(monkeypatch):
 
 
 @pytest.mark.parametrize("rank", [0, 5])
-def test_whole_schedule_and_validation_identical(monkeypatch, rank):
+@pytest.mark.parametrize("scheduled", [1122, 978])  # the record's schedule (1194 steps) and the stack's (1050)
+def test_whole_schedule_and_validation_identical(monkeypatch, rank, scheduled):
     record = record_data_module()
     for module in (record, new_data):
         unpinned(module, monkeypatch)
@@ -98,7 +99,7 @@ def test_whole_schedule_and_validation_identical(monkeypatch, rank):
     deterministic_index_switch(record, monkeypatch)
     monkeypatch.setattr(dist, "get_rank", lambda: rank)
     monkeypatch.setattr(dist, "get_world_size", lambda: 8)
-    args = Hyperparameters()
+    args = Hyperparameters(num_scheduled_iterations=scheduled)
     schedule = TrainingSchedule(TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations,
                                 device="cpu", cooldown_frac=LR_COOLDOWN_FRAC, split_embed_stage=SPLIT_EMBED_STAGE,
                                 ws_post_yarn_ext=WS_POST_YARN_EXT)

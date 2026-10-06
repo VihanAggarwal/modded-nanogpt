@@ -15,7 +15,7 @@ index 7c9ed88..9f45b08 100644
          self.rank, world = dist.get_rank(group), dist.get_world_size(group)
          self.offsets = range(self.rank * chunk, total, world * chunk)
 diff --git a/train_gpt.py b/train_gpt.py
-index 275cff0..e47d2cf 100644
+index 275cff0..bc624e1 100644
 --- a/train_gpt.py
 +++ b/train_gpt.py
 @@ -21,6 +21,10 @@ import copy
@@ -70,7 +70,7 @@ index 275cff0..e47d2cf 100644
      row_prefetch = RowPrefetch(ngram_table, value_embed_pull, batches, range(training_schedule.total_steps),
                                 is_update_step, prefetch_staging)
  
-@@ -401,9 +419,43 @@ def main():
+@@ -401,9 +419,50 @@ def main():
                      val_loss += model(batch.inputs, batch.targets, batch.cum_seqlens, ngram_table.slots(pull, batch.ngram_ids),
                                        training_manager.get_forward_args(), ret=torch.as_tensor(rows, device=env.device)).mean()
              val_loss /= val_steps
@@ -81,6 +81,10 @@ index 275cff0..e47d2cf 100644
 +                # Untimed, paired: the same weights and validation tokens, scored with rows from a SlotIndex over only
 +                # the tokens this run trained on ("stream"), and with no rows ("none"). The run's own line above is
 +                # the shipped 103-shard index.
++                # One 103 GB SlotIndex table at a time fits /dev/shm: every rank closes its handle on the shipped
++                # (already unlinked) table first, and rank 0's builder was released after its build.
++                val_cache.index = None
++                dist.barrier(val_group)
 +                path = [None]
 +                if env.master_process:
 +                    stream = np.concatenate(trained_segments).astype(np.uint16)
@@ -92,25 +96,28 @@ index 275cff0..e47d2cf 100644
 +                        f.write(stream.tobytes())
 +                    print0(f"gate: trained stream of {len(stream)} tokens", console=True)
 +                dist.broadcast_object_list(path, src=0)
-+                stream_cache = ValidationCache(path[0], args.val_files, val_tokens_per_rank, args.val_tokens, val_group,
-+                                               cpus.val_build, cpus.val_lookup, shards=None)
-+                built = Future()
-+                built.set_result(None)
-+                stream_cache.start(built)
-+                stream_cache.lookup()
-+                for name, gate_rows in (("stream", stream_cache.rows()), ("none", [np.zeros_like(r) for r in val_rows])):
-+                    gate_loss = 0
-+                    with torch.no_grad():
-+                        for batch, pull, rows in zip(val_batches, val_pulls, gate_rows):
-+                            ngram_table.land(pull)
-+                            gate_loss += model(batch.inputs, batch.targets, batch.cum_seqlens,
-+                                               ngram_table.slots(pull, batch.ngram_ids), training_manager.get_forward_args(),
-+                                               ret=torch.as_tensor(rows, device=env.device)).mean()
-+                    gate_loss /= val_steps
-+                    dist.reduce(gate_loss, 0, op=dist.ReduceOp.AVG)
-+                    print0(f"gate val_loss[{name}]:{gate_loss:.4f}", console=True)
-+                if env.master_process:
-+                    os.unlink(path[0])
++                try:
++                    stream_cache = ValidationCache(path[0], args.val_files, val_tokens_per_rank, args.val_tokens, val_group,
++                                                   cpus.val_build, cpus.val_lookup, shards=None)
++                    built = Future()
++                    built.set_result(None)
++                    stream_cache.start(built)
++                    stream_cache.lookup()
++                    for name, gate_rows in (("stream", stream_cache.rows()), ("none", [np.zeros_like(r) for r in val_rows])):
++                        gate_loss = 0
++                        with torch.no_grad():
++                            for batch, pull, rows in zip(val_batches, val_pulls, gate_rows):
++                                ngram_table.land(pull)
++                                gate_loss += model(batch.inputs, batch.targets, batch.cum_seqlens,
++                                                   ngram_table.slots(pull, batch.ngram_ids), training_manager.get_forward_args(),
++                                                   ret=torch.as_tensor(rows, device=env.device)).mean()
++                        gate_loss /= val_steps
++                        dist.reduce(gate_loss, 0, op=dist.ReduceOp.AVG)
++                        print0(f"gate val_loss[{name}]:{gate_loss:.4f}", console=True)
++                    stream_cache.index = None
++                finally:
++                    if env.master_process:
++                        os.unlink(path[0])
 +            del val_batches, val_pulls
              # The clock is stopped: flush the log and collect the loop's garbage here.
              flush_log()
