@@ -45,8 +45,12 @@ class Config:
     lr_scalar: float = 0.02       # Adam: scalars and small vectors
     momentum: float = 0.95
     weight_decay: float = 0.0
-    cooldown_frac: float = 0.5    # linear decay to lr_floor over the last fraction of steps
+    cooldown_frac: float = 0.5    # decay to lr_floor over the last fraction of steps
     lr_floor: float = 0.1
+    cooldown_power: float = 1.0   # 1 = linear; >1 decays faster early in the cooldown ("PowerCool")
+    snoo_every: int = 0           # >0: Snoo-style outer Nesterov step on slow weights every this many steps
+    snoo_lr: float = 0.7
+    snoo_momentum: float = 0.5
     warmup_steps: int = 0
     # ideas (flags)
     orth: str = "ns5"             # ns5 | polar (Polar Express) | none (plain momentum SGD, normalized)
@@ -61,6 +65,8 @@ class Config:
     smear: bool = False           # gated 1-token look-back on the embeddings
     attn_gate: bool = False       # per-head sigmoid output gate from the block input
     bigram_rows: int = 0          # hashed bigram embedding table rows (0 = off)
+    trigram_rows: int = 0         # hashed trigram embedding table rows (0 = off)
+    ngram_gate: bool = False      # content-aware sigmoid gate on the hashed n-gram embeddings (Engram-style)
     mtp: float = 0.0              # weight of a t+2 prediction loss through the same head
     zloss: float = 0.0            # weight of the softmax normalizer z-loss
     qk_norm: bool = True
@@ -94,9 +100,13 @@ VARIANTS = {
     "softcap30": {"softcap": 30.0},
     "no_qk_norm": {"qk_norm": False},
     "cooldown_0.8": {"cooldown_frac": 0.8},
-    "tied": {"tie_embed": True},
+    "tied": {"tie_embed": True, "lr_embed": 0.01},  # the shared matrix is the head too: a head-sized lr
     "momentum_0.9": {"momentum": 0.9},
     "lr_hidden_x1.5": {"lr_hidden": 0.045},
+    "powercool": {"cooldown_power": 2.0},
+    "snoo": {"snoo_every": 8},
+    "trigram_hash": {"bigram_rows": 1 << 18, "trigram_rows": 1 << 18},
+    "ngram_gate": {"bigram_rows": 1 << 18, "ngram_gate": True},
 }
 
 
@@ -218,6 +228,12 @@ class GPT(nn.Module):
         if cfg.bigram_rows:
             self.bigram = nn.Embedding(cfg.bigram_rows, cfg.d_model)
             nn.init.zeros_(self.bigram.weight)
+        if cfg.trigram_rows:
+            self.trigram = nn.Embedding(cfg.trigram_rows, cfg.d_model)
+            nn.init.zeros_(self.trigram.weight)
+        if cfg.ngram_gate:
+            self.ngram_gate_w = nn.Linear(12, 1, bias=False)
+            nn.init.zeros_(self.ngram_gate_w.weight)
 
     def value_embed_for(self, layer: int, ves):
         # U-net pattern: table i feeds layer i and layer n_layer - 1 - i
@@ -233,7 +249,13 @@ class GPT(nn.Module):
         x = self.embed(idx)
         if cfg.bigram_rows:
             prev = F.pad(idx[:, :-1], (1, 0), value=BOS)
-            x = x + self.bigram((prev * 36313 + idx * 27191) % cfg.bigram_rows)
+            ngram = self.bigram((prev * 36313 + idx * 27191) % cfg.bigram_rows)
+            if cfg.trigram_rows:
+                prev2 = F.pad(idx[:, :-2], (2, 0), value=BOS)
+                ngram = ngram + self.trigram((prev2 * 1000003 + prev * 36313 + idx * 27191) % cfg.trigram_rows)
+            if cfg.ngram_gate:  # starts open (2 * sigmoid(0) = 1): the gate learns what to trust
+                ngram = ngram * 2 * torch.sigmoid(self.ngram_gate_w(x[..., :12]))
+            x = x + ngram
         if cfg.smear:
             x = torch.cat([x[:, :1], x[:, 1:] + torch.sigmoid(self.smear_gate(x[:, 1:, :12])) * x[:, :-1]], dim=1)
         x = x0 = norm(x)
@@ -319,8 +341,8 @@ class Muon(torch.optim.Optimizer):
 def build_optimizers(model: GPT, cfg: Config):
     hidden = [p for n, p in model.named_parameters() if p.ndim == 2 and "blocks" in n and "gate" not in n]
     hidden_ids = {id(p) for p in hidden}
-    embeds = [p for n, p in model.named_parameters() if ("embed" in n or n.startswith("ve.") or "bigram" in n)
-              and id(p) not in hidden_ids]
+    embeds = [p for n, p in model.named_parameters() if ("embed" in n or n.startswith("ve.") or "gram" in n)
+              and "gate" not in n and id(p) not in hidden_ids]
     head = [] if cfg.tie_embed else [model.head.weight]
     taken = hidden_ids | {id(p) for p in embeds + head}
     scalars = [p for p in model.parameters() if id(p) not in taken]
@@ -344,7 +366,7 @@ def lr_mult(step: int, cfg: Config) -> float:
     if step < cd_start:
         return 1.0
     t = (step - cd_start) / max(1, cfg.steps - cd_start)
-    return 1.0 * (1 - t) + cfg.lr_floor * t
+    return cfg.lr_floor + (1.0 - cfg.lr_floor) * (1 - t) ** cfg.cooldown_power
 
 
 # ------------------------------------------------------------------------------------------------ run
@@ -370,6 +392,9 @@ def train(cfg: Config, data_dir: str, device, log_every: int = 100) -> dict:
     opts = build_optimizers(model, cfg)
     fwd = torch.compile(model) if cfg.compile else model
     stream = TrainStream(f"{data_dir}/fineweb_train_*.bin", cfg.seq_len)
+    # Snoo: slow weights take a Nesterov step toward the fast weights every snoo_every steps; fast restart there.
+    slow = [p.detach().clone() for p in model.parameters()] if cfg.snoo_every else None
+    outer_m = [torch.zeros_like(p) for p in model.parameters()] if cfg.snoo_every else None
     val = load_tokens(sorted(glob.glob(f"{data_dir}/fineweb_val_*.bin"))[0], cfg.val_tokens + 1)
     t0 = time.perf_counter()
     for step in range(cfg.steps):
@@ -385,6 +410,13 @@ def train(cfg: Config, data_dir: str, device, log_every: int = 100) -> dict:
                 group["lr"] = group["initial_lr"] * mult
             opt.step()
         model.zero_grad(set_to_none=True)
+        if cfg.snoo_every and (step + 1) % cfg.snoo_every == 0:
+            with torch.no_grad():
+                for p, s, m in zip(model.parameters(), slow, outer_m):
+                    delta = p - s  # the inner steps' displacement (the negative outer gradient)
+                    m.mul_(cfg.snoo_momentum).add_(delta)
+                    s.add_(delta + cfg.snoo_momentum * m, alpha=cfg.snoo_lr)
+                    p.copy_(s)
         if log_every and (step + 1) % log_every == 0:
             print(f"  step {step + 1}/{cfg.steps} train loss {loss.item():.4f} ({time.perf_counter() - t0:.0f}s)", flush=True)
     if device.type == "cuda":
