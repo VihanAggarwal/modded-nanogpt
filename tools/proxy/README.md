@@ -5,7 +5,12 @@ The record needs 8xH100. `proxy_gpt.py` screens ideas first on one GPU: a compac
 shards. Every variant sees the same tokens in the same order, so the val-loss differences come from the idea
 and from seed noise. Ideas that win clearly here go to the 8xH100 sweep (`tools/speedrun_ab`).
 
-In a Colab notebook with an A100, L4 or H100 runtime (a T4 works but is ~10x slower):
+**Easiest:** upload `nanogpt_proxy_screen.ipynb` to Colab (File → Upload notebook), pick an A100 or H100 runtime
+and Run all. It is self-contained: the code is inline, and the data comes from Hugging Face. It screens the
+record's own techniques as calibration, plus the new candidates, then re-tests the winners on a stack of the
+calibration winners. Regenerate it after editing `proxy_gpt.py` with the notebook builder.
+
+Or, from a clone, in a Colab notebook with an A100, L4 or H100 runtime (a T4 works but is ~10x slower):
 
 ```
 !git clone -b claude/nanogpt-optimization-n49ur2 https://github.com/VihanAggarwal/modded-nanogpt

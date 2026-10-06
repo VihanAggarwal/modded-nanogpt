@@ -24,6 +24,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# bf16 autocast where the GPU has bf16 tensor cores (A100, L4, H100); fp32 elsewhere (CPU, T4).
+AMP = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
 BOS = 50256
 VOCAB = 50304  # 50257 padded to a multiple of 128, as the record
 
@@ -70,6 +72,8 @@ class Config:
     mtp: float = 0.0              # weight of a t+2 prediction loss through the same head
     zloss: float = 0.0            # weight of the softmax normalizer z-loss
     qk_norm: bool = True
+    canon: bool = False           # Canon layers: zero-init causal depthwise conv (k=4) before attention and the MLP
+    diff_attn: bool = False       # differential attention: softmax(q1 k1) - lambda softmax(q2 k2) on half-width q, k
     attn_scale: float = 0.0       # 0 = 1/sqrt(head_dim)
     tie_embed: bool = False
     seed: int = 0
@@ -107,6 +111,8 @@ VARIANTS = {
     "snoo": {"snoo_every": 8},
     "trigram_hash": {"bigram_rows": 1 << 18, "trigram_rows": 1 << 18},
     "ngram_gate": {"bigram_rows": 1 << 18, "ngram_gate": True},
+    "canon": {"canon": True},
+    "diff_attn": {"diff_attn": True},
 }
 
 
@@ -179,25 +185,55 @@ class Block(nn.Module):
         if cfg.attn_gate:
             self.gate = nn.Linear(12, self.n_head, bias=False)
             nn.init.zeros_(self.gate.weight)
+        if cfg.canon:  # depthwise, causal, zero-init: each block starts as before
+            self.canon_a = nn.Conv1d(d, d, 4, groups=d, bias=False)
+            self.canon_c = nn.Conv1d(d, d, 4, groups=d, bias=False)
+            nn.init.zeros_(self.canon_a.weight)
+            nn.init.zeros_(self.canon_c.weight)
+        if cfg.diff_attn:
+            self.rotary_half = Rotary(hd // 2, cfg.seq_len)
+            self.diff_lambda = nn.Parameter(torch.tensor(0.2))
+
+    @staticmethod
+    def causal_conv(conv, h):
+        return h + conv(F.pad(h.transpose(1, 2), (conv.kernel_size[0] - 1, 0))).transpose(1, 2)
+
+    def attend(self, q, k, v):
+        """[B, T, H, D] -> [B, T, H, D] causal attention (differential if configured)."""
+        scale = self.cfg.attn_scale or None
+        if not self.cfg.diff_attn:
+            if self.cfg.qk_norm:
+                q, k = norm(q), norm(k)
+            q, k = self.rotary(q), self.rotary(k)
+            return F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                                                  is_causal=True, scale=scale).transpose(1, 2)
+        ys = []
+        for qh, kh in zip(q.chunk(2, dim=-1), k.chunk(2, dim=-1)):
+            if self.cfg.qk_norm:
+                qh, kh = norm(qh), norm(kh)
+            qh, kh = self.rotary_half(qh), self.rotary_half(kh)
+            ys.append(F.scaled_dot_product_attention(qh.transpose(1, 2), kh.transpose(1, 2), v.transpose(1, 2),
+                                                     is_causal=True, scale=scale).transpose(1, 2))
+        return norm(ys[0] - self.diff_lambda * ys[1]) * (1 - 0.2)  # per-head norm, scaled as in the paper
 
     def forward(self, x, x0, ve):
         if self.cfg.x0_mix:
             x = self.lambdas[0] * x + self.lambdas[1] * x0
         B, T, _ = x.shape
         h = norm(x)
+        if self.cfg.canon:
+            h = self.causal_conv(self.canon_a, h)
         q, k, v = self.qkv(h).view(B, T, 3, self.n_head, -1).unbind(2)
-        if self.cfg.qk_norm:
-            q, k = norm(q), norm(k)
-        q, k = self.rotary(q), self.rotary(k)
         if ve is not None:
             v = self.ve_lambda * v + (1 - self.ve_lambda) * ve.view_as(v)
-        scale = self.cfg.attn_scale or None
-        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True,
-                                           scale=scale).transpose(1, 2)
+        y = self.attend(q, k, v)
         if self.cfg.attn_gate:
             y = y * torch.sigmoid(self.gate(h[..., :12]) + 2.0)[..., None]  # starts near open
         x = x + self.proj(y.reshape(B, T, -1))
-        h = self.fc(norm(x))
+        h = norm(x)
+        if self.cfg.canon:
+            h = self.causal_conv(self.canon_c, h)
+        h = self.fc(h)
         if self.cfg.act == "relu2":
             h = F.relu(h).square()
         elif self.cfg.act == "gelu":
@@ -293,7 +329,7 @@ POLAR_EXPRESS = [
 
 
 def orthogonalize(G: torch.Tensor, coeffs, safety: float = 1.0) -> torch.Tensor:
-    X = G.to(torch.bfloat16 if G.is_cuda else torch.float32)
+    X = G.to(torch.bfloat16 if AMP else torch.float32)
     transpose = X.size(0) > X.size(1)
     if transpose:
         X = X.T
@@ -380,7 +416,7 @@ def evaluate(model: GPT, val: np.ndarray, cfg: Config, device) -> float:
         rows = min(cfg.batch_seqs, n - i)
         chunk = torch.from_numpy(val[i * cfg.seq_len:(i + rows) * cfg.seq_len + 1].astype(np.int64)).to(device)
         x, y = chunk[:-1].view(rows, cfg.seq_len), chunk[1:].view(rows, cfg.seq_len)
-        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=AMP):
             losses.append(model(x, y).item() * rows)
     model.train()
     return sum(losses) / n
@@ -401,7 +437,7 @@ def train(cfg: Config, data_dir: str, device, log_every: int = 100) -> dict:
         chunk = stream.next(cfg.batch_seqs).to(device, non_blocking=True)
         x = chunk[:-1].view(cfg.batch_seqs, cfg.seq_len)
         y = chunk[1:].view(cfg.batch_seqs, cfg.seq_len)
-        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=AMP):
             loss = fwd(x, y)
         loss.backward()
         mult = lr_mult(step, cfg)
