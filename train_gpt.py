@@ -383,7 +383,9 @@ def main():
     uncompiled_model.limit_yarn_rebuild(max_step_tokens)
 
     training_time_ms = 0
-    # start the clock
+    # start the clock, on every rank at once: rank 0 alone registers the mask buffer and checks the builder
+    # just before here, and the other ranks' first on-clock loader work must not start ahead of its clock
+    dist.barrier()
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     # The loader is lazy: its first fetch reads the first shard. Started now, it overlaps the table build.

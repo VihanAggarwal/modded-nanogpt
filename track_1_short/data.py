@@ -177,14 +177,18 @@ class Shard:
         result = {}
         ready = threading.Event()
         def load():
-            tokens = _load_data_shard(file)
-            result['shard'] = Shard(tokens, world_size)
-            ready.set()
+            try:
+                tokens = _load_data_shard(file)
+                result['shard'] = Shard(tokens, world_size)
+            finally:
+                ready.set()  # also on failure: get() raises rather than waiting forever
         thread = threading.Thread(target=load)
         thread.start()
         def get():
             ready.wait()
             thread.join()
+            if 'shard' not in result:
+                raise RuntimeError(f"loading {file} failed (traceback above)")
             return result['shard']
         return get
 
