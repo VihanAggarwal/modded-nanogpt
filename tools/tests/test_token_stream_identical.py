@@ -63,10 +63,10 @@ def same_batch(a, b) -> bool:
 
 def deterministic_index_switch(module, monkeypatch):
     """A shard starts on a partial BOS index while a thread scans the whole shard. If batches outrun the
-    scan, the loader reads the partial index's end as the shard's end and skips to the next shard. A
-    real run cannot outrun it (the host runs at most a few steps ahead of 17 ms GPU steps: 6M tokens
-    last >~0.6 s against a ~0.07-0.3 s scan), but this test fetches back to back, so both loaders wait
-    for the scan here."""
+    scan, the record's loader reads the partial index's end as the shard's end and skips to the next
+    shard. A real run cannot outrun it (the host runs at most a few steps ahead of 17 ms GPU steps: 6M
+    tokens last >~0.6 s against a ~0.3 s scan), but this test fetches back to back, so the record's loader
+    waits for the scan here."""
     switch = module.Shard._maybe_switch
 
     def waiting_switch(self):
@@ -93,7 +93,9 @@ def test_whole_schedule_and_validation_identical(monkeypatch, rank):
     record = record_data_module()
     for module in (record, new_data):
         unpinned(module, monkeypatch)
-        deterministic_index_switch(module, monkeypatch)
+    # The record's loader can only be compared on its intended stream (it must not outrun its scan); this
+    # branch's loader waits for the full index itself, so it runs as it would in the trainer.
+    deterministic_index_switch(record, monkeypatch)
     monkeypatch.setattr(dist, "get_rank", lambda: rank)
     monkeypatch.setattr(dist, "get_world_size", lambda: 8)
     args = Hyperparameters()
@@ -115,3 +117,18 @@ def test_whole_schedule_and_validation_identical(monkeypatch, rank):
                       (m.distributed_data_generator(val, args.val_batch_size, -1, HostStaging(), align_to_bos=False)
                        for m in (record, new_data))]):
         assert same_batch(a, b), f"rank {rank}: a validation batch differs"
+
+
+def test_failed_background_read_raises_instead_of_hanging(monkeypatch):
+    unpinned(new_data, monkeypatch)
+    path = sorted((DATA / "data/fineweb10B").glob("fineweb_train_*.bin"))[0]
+    tokens, _ = new_data._load_data_shard(path, head_tokens=new_data.PARTIAL_INDEX_TOKENS)
+
+    def failing_read():
+        raise OSError("simulated short read")
+
+    shard = new_data.Shard(tokens, 8, failing_read)
+    shard._loader_thread.join()
+    shard.i = len(shard.bos_idx) - 2  # the next batch needs the full index
+    with pytest.raises(RuntimeError, match="background read or BOS scan failed"):
+        shard.next_batch(16384, 896)
