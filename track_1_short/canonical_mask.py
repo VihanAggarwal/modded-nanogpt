@@ -19,6 +19,9 @@ from torch import Tensor
 from track_1_short.canonical_mask_build import build_canonical_mask
 
 BUILD_SCRIPT = Path(__file__).resolve().with_name("canonical_mask_build.py")
+# The builder starts at this step, on the clock: once the training loop is in steady state, so its CPU
+# work does not compete with the host-bound first steps.
+BUILD_START_STEP = 25
 
 
 class BackgroundCanonicalMask:
@@ -28,12 +31,12 @@ class BackgroundCanonicalMask:
     and throttle the training loop's kernel launches. A separate process has its own interpreter and
     only computes, writing the result into shared memory.
 
-    The process is a fresh interpreter, spawned (vfork + exec) when the clock starts: its startup, its
-    imports, the tokenizer load and the build all run on the clock, off the training loop's path.
-    Record #350 forked the trainer itself there instead. fork() copies the page tables of the whole
-    warmed-up 8-GPU process, and every page the trainer then writes takes a copy-on-write fault while
-    the child lives, all on rank 0's launch path in the first steps, which every rank waits for at its
-    next collective. A spawn costs the trainer the same fraction of a millisecond at any size.
+    The process is a fresh interpreter, spawned (vfork + exec) at step BUILD_START_STEP: its startup,
+    its imports, the tokenizer load and the build all run on the clock, off the training loop's path.
+    Record #350 forked the trainer itself at the clock's start instead. fork() copies the page tables of
+    the whole warmed-up 8-GPU process, and every page the trainer then writes takes a copy-on-write fault
+    while the child lives, all on rank 0's launch path, which every rank waits for at its next
+    collective. A spawn costs the trainer the same fraction of a millisecond at any size.
     """
 
     def __init__(self, vocab_size: int, owner: bool, print0):
@@ -57,16 +60,28 @@ class BackgroundCanonicalMask:
             if not self.pinned:
                 print0(f"NOTE: could not page-lock the canonical mask buffer ({err}), "
                        "so its copy to device will be slower", console=True)
+            # Before the clock: the builder's interpreter must import numpy and tiktoken and find the
+            # tokenizer, or the build would fall back to rank 0, inline and on the clock.
+            check = subprocess.run(self._command("--check"), capture_output=True, text=True, timeout=300)
+            if check.returncode:
+                raise RuntimeError(f"the canonical mask builder cannot run: {check.stderr.strip()}")
+        self.started = False
+
+    @staticmethod
+    def _command(*args: str) -> list[str]:
+        # -P: nothing beside the script shadows an import (the environment and site-packages still apply).
+        return [sys.executable, "-P", str(BUILD_SCRIPT), *args]
 
     def start(self):
-        """Spawn the builder. Called as the clock starts. -I: nothing beside the script shadows an import."""
-        if self.buf is None:
+        """Spawn the builder (once). Called on the clock at step BUILD_START_STEP."""
+        if self.buf is None or self.started:
             return
-        self.proc = subprocess.Popen([sys.executable, "-I", str(BUILD_SCRIPT), str(self.fd), str(self.vocab_size)],
-                                     pass_fds=(self.fd,))
+        self.started = True
+        self.proc = subprocess.Popen(self._command(str(self.fd), str(self.vocab_size)), pass_fds=(self.fd,))
 
     def wait(self, timeout=60.0):
         """Block until the mask is ready. Called from the timed region."""
+        self.start()  # a run shorter than BUILD_START_STEP steps
         if self.proc is None:
             return
         try:
@@ -88,6 +103,6 @@ class BackgroundCanonicalMask:
                 torch.cuda.cudart().cudaHostUnregister(self.buf.data_ptr())
         dist.broadcast(out, 0)
         if self.buf is not None:
-            self.buf = None
-            self.map.close()
+            # Dropped, not closed: the mapping goes when its last view does.
+            self.buf = self.map = None
             os.close(self.fd)

@@ -31,7 +31,7 @@ import torch.distributed as dist
 from torch import nn
 
 # torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
-from track_1_short.canonical_mask import BackgroundCanonicalMask
+from track_1_short.canonical_mask import BUILD_START_STEP, BackgroundCanonicalMask
 from track_1_short.config import (
     LR_COOLDOWN_FRAC,
     SPLIT_EMBED_STAGE,
@@ -298,8 +298,9 @@ def main():
 
     # The canonical mask is only needed by the final validation, so rank 0 builds it in a child
     # process while we train, and model.canon_mask stays all-zero == no masking until then, which
-    # is what the intermediate validations run with. Only the buffer is allocated here; the build
-    # is started below the clock, so its whole cost -- not just its use -- lands in the timed region.
+    # is what the intermediate validations run with. Only the buffer is allocated (and the builder's
+    # interpreter checked) here; the build starts on the clock, at step BUILD_START_STEP, so its whole
+    # cost -- not just its use -- lands in the timed region.
     canon_mask_builder = BackgroundCanonicalMask(model.vocab_size, owner=env.master_process, print0=print0)
 
     # Loader work off the main thread, on the clock: step 0's batch (the first shard's read and index)
@@ -324,7 +325,6 @@ def main():
     # start the clock
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    canon_mask_builder.start()
     # The loader is lazy: its first fetch reads the first shard. Started now, it overlaps the table build.
     first_batch = loader_thread.submit(batches.peek, 0)
     # Prefix-token table build, inside the timed region. The tokenizer was loaded at import
@@ -408,6 +408,8 @@ def main():
             break
 
         # --------------- TRAINING SECTION -----------------
+        if step == BUILD_START_STEP:
+            canon_mask_builder.start()  # the canonical mask's build, on the clock (canonical_mask.py)
         train_step(training_manager, step_graphs, row_prefetch, sampled_softmax, batches, deferred_gathers,
                    step, uncompiled_model.lm_head_f8_col, prefetch_next=step + 1 < training_schedule.total_steps)
         tail_averages.tick(step)

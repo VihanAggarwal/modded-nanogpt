@@ -92,9 +92,30 @@ def section_a_pinned_cache():
     t0 = time.perf_counter()
     again = torch.empty(n, dtype=torch.uint16, pin_memory=True)
     reused = ms(t0)
-    report("A. pinned cache reuses a freed 256 MB block", again.data_ptr() == ptr,
+    report("A1. pinned cache reuses a freed 256 MB block", again.data_ptr() == ptr,
            f"fresh cudaHostAlloc {fresh:.1f} ms, reused {reused:.3f} ms (the val read's allocation, before/after)")
     del again
+    # A fresh pinned allocation on another thread, while this thread launches kernels: does the driver
+    # hold up the launches (a second 256 MB-class block would be fresh: one is cached now, so 512 MB)?
+    x = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
+    for _ in range(50):
+        x @ x
+    torch.cuda.synchronize()
+    done = []
+    worker = ThreadPoolExecutor(1)
+    alloc = worker.submit(lambda: (torch.empty(200_000_000, dtype=torch.uint16, pin_memory=True), done.append(1))[0])
+    gaps, last = [], time.perf_counter()
+    while not done:
+        x.add_(0)
+        now = time.perf_counter()
+        gaps.append(now - last)
+        last = now
+    block = alloc.result()
+    worker.shutdown()
+    torch.cuda.synchronize()
+    report("A2. launches during a fresh 512 MB pinned allocation on another thread", True,
+           f"{len(gaps)} launches, longest gap {1000 * max(gaps):.1f} ms (a stall here is what the val read paid)")
+    del block, x
 
 
 def section_b_loader(data_dir: Path, device: torch.device):
@@ -132,21 +153,51 @@ def section_b_loader(data_dir: Path, device: torch.device):
                                                                        staging[0]), schedule, steps=range(steps))
         new = branch.ScheduledBatches(branch.distributed_data_generator(train, first.batch_size, first.train_max_seq_len,
                                                                         staging[1]), schedule, steps=range(steps))
+        exhausted = [0]
+        next_batch = branch.Shard._next_batch
+
+        def counting_next_batch(shard, *a):
+            try:
+                return next_batch(shard, *a)
+            except branch.PartialIndexExhausted:
+                exhausted[0] += 1
+                raise
+
+        branch.Shard._next_batch = counting_next_batch
         loader_thread = ThreadPoolExecutor(1, initializer=torch.cuda.set_device, initargs=(device,))
         t0 = time.perf_counter()
         first_record = rec.peek(0)
         record_first = ms(t0)
+        x = torch.randn(4096, 4096, device=device, dtype=torch.bfloat16)
         t0 = time.perf_counter()
-        first_new = loader_thread.submit(new.peek, 0).result()
+        first_new = loader_thread.submit(new.peek, 0)
+        for _ in range(100):  # the GPU busy on the main thread's stream while the loader thread uploads
+            x @ x
+        first_new = first_new.result()
         new_first = ms(t0)
+        shard = new.loader.gi_frame.f_locals["shard"]
+        shard._ready.wait()
+        scan = ms(t0)
         torch.cuda.synchronize()
+        del x
         ok = same_batch(first_record, first_new)
         for step in range(steps):
             ok &= same_batch(rec.take(step), new.take(step))
         torch.cuda.synchronize()
+        branch.Shard._next_batch = next_batch
         report("B1. training batches identical (record loader on the main thread vs this branch, first fetch on "
-               "the loader thread)", ok, f"first fetch {record_first:.1f} ms -> {new_first:.1f} ms")
+               "the loader thread)", ok, f"first fetch {record_first:.1f} ms -> {new_first:.1f} ms; first shard's "
+               f"tail read + full scan done {scan:.0f} ms after the fetch started; partial index outrun "
+               f"{exhausted[0]}x (back-to-back fetching; a paced run: 0)")
+        frame = new.loader.gi_frame.f_locals
+        train_blocks = {frame["tokens"].data_ptr(), frame["next_shard_getter"]().tokens.data_ptr()}
         new.close()
+        val_it = branch.distributed_data_generator(str(data_dir / "fineweb_val_*.bin"), args.val_batch_size, -1,
+                                                   staging[1], align_to_bos=False)
+        next(val_it)
+        report("B2. after close(), the val shard's read reuses a training shard's pinned block",
+               val_it.gi_frame.f_locals["tokens"].data_ptr() in train_blocks)
+        val_it.close()
 
         def read_val(module, stage):
             it = module.distributed_data_generator(str(data_dir / "fineweb_val_*.bin"), args.val_batch_size, -1, stage,
@@ -157,7 +208,7 @@ def section_b_loader(data_dir: Path, device: torch.device):
         t0 = time.perf_counter()
         val_new = loader_thread.submit(read_val, branch, staging[1]).result()
         torch.cuda.synchronize()
-        report("B2. val batches identical (read on the loader thread)",
+        report("B3. val batches identical (read on the loader thread)",
                all(same_batch(a, b) for a, b in zip(val_record, val_new)), f"threaded val read {ms(t0):.1f} ms")
         loader_thread.shutdown()
     finally:
@@ -174,6 +225,7 @@ def section_c_canonical_mask(device: torch.device):
     t0 = time.perf_counter()
     builder.start()
     spawn = ms(t0)
+    started = t0
     t0 = time.perf_counter()
     pid = os.fork()
     if pid == 0:
@@ -182,6 +234,7 @@ def section_c_canonical_mask(device: torch.device):
     os.waitpid(pid, 0)
     del ballast
     builder.wait()
+    built = ms(started)
     out = torch.zeros(vocab, vocab // 8, dtype=torch.uint8, device=device)
     t0 = time.perf_counter()
     builder.collect(out)
@@ -190,15 +243,17 @@ def section_c_canonical_mask(device: torch.device):
     expected = build_canonical_mask(vocab)
     report("C2. spawned build collected to the GPU equals the inline build",
            np.array_equal(out.cpu().numpy(), expected) and not any("WARNING" in s for s in logs),
-           f"start() {spawn:.2f} ms vs os.fork() {fork:.2f} ms (4 GB host + CUDA context); collect {collect:.1f} ms")
+           f"start() {spawn:.2f} ms vs os.fork() {fork:.2f} ms (4 GB host + CUDA context); spawn to built "
+           f"{built / 1000:.1f} s; collect {collect:.1f} ms")
 
 
 def main():
     assert torch.cuda.is_available(), "needs a CUDA GPU"
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
+    thp = Path("/sys/kernel/mm/transparent_hugepage/enabled")
     print(f"{torch.cuda.get_device_name(device)} | torch {torch.__version__} | CUDA {torch.version.cuda} | "
-          f"{os.cpu_count()} CPUs", flush=True)
+          f"{os.cpu_count()} CPUs | THP {thp.read_text().strip() if thp.exists() else '?'}", flush=True)
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29561")
     dist.init_process_group("cuda:nccl,cpu:gloo", rank=0, world_size=1, device_id=device)

@@ -75,7 +75,7 @@ def test_builder_imports_neither_torch_nor_the_trainer():
     """The spawned interpreter's imports are on the clock: the build module must stay torch-free."""
     code = (f"import sys; sys.path.insert(0, {str(ROOT / 'track_1_short')!r}); import canonical_mask_build; "
             "print(sorted(m for m in sys.modules if m.split('.')[0] in ('torch', 'track_1_short', 'triton')))")
-    out = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, check=True).stdout
+    out = subprocess.run([sys.executable, "-P", "-c", code], capture_output=True, text=True, check=True).stdout
     assert out.strip() == "[]"
 
 
@@ -86,9 +86,24 @@ def test_non_owner_spawns_nothing():
     builder.wait()
 
 
-def test_failed_build_falls_back_to_inline_build(reference_mask, gloo_group, monkeypatch):
+def test_preflight_fails_before_the_clock(monkeypatch):
     monkeypatch.setattr(canonical_mask, "BUILD_SCRIPT", Path("/nonexistent/canonical_mask_build.py"))
+    with pytest.raises(RuntimeError, match="cannot run"):
+        make_builder()
+
+
+def test_wait_starts_a_builder_never_started(reference_mask, gloo_group):
+    """A run shorter than BUILD_START_STEP steps still gets its mask."""
     builder = make_builder()
+    builder.wait()
+    out = torch.zeros(VOCAB, VOCAB // 8, dtype=torch.uint8)
+    builder.collect(out)
+    assert np.array_equal(out.numpy(), reference_mask)
+
+
+def test_failed_build_falls_back_to_inline_build(reference_mask, gloo_group, monkeypatch):
+    builder = make_builder()  # preflight passes; the build itself then fails
+    monkeypatch.setattr(canonical_mask, "BUILD_SCRIPT", Path("/nonexistent/canonical_mask_build.py"))
     builder.start()
     builder.wait()  # the interpreter exits 2 (no such script): build inline
     assert any("building it inline" in line for line in builder.logged)
@@ -104,6 +119,7 @@ def test_start_costs_the_trainer_little_at_any_size():
     builder = make_builder()
     started = time.perf_counter()
     builder.start()
+    builder.start()  # idempotent
     spawn_ms = 1000 * (time.perf_counter() - started)
     builder.proc.kill()
     builder.proc.wait()

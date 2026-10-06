@@ -18,12 +18,15 @@ pip install -r cand/requirements.txt
 ## Run
 
 ```bash
-python cand/tools/speedrun_ab/ab_bench.py --arm baseline=base --arm candidate=cand --legs 10 --cold \
+python cand/tools/speedrun_ab/ab_bench.py --arm baseline=base --arm candidate=cand --legs 10 \
     --out ab_runs/$(date +%m%d_%H%M)
 ```
 
-- Each leg is one full `torchrun` run of about 8 minutes cold (7 minutes of compile), so 10 legs per arm take about 2.7 hours.
-  Without `--cold` the arms reuse their compile caches and a leg takes about 1.5 minutes.
+- Warm caches (the default): each arm reuses its compile caches after its first leg, about 1.5 minutes
+  per leg, so 10 legs per arm take about 30 minutes. That is the right setting for a systems A/B: about 10
+  pairs resolve ~0.05 s (#379 measured the record at 40.575 +/- 0.024 s, n=13).
+- `--cold` gives every leg empty caches, as the ANVIL2 certification did. Each leg then takes about 8
+  minutes, 7 of them compiling.
 - `--dry-run` prints the plan and the preflight checks (GPU count, driver, torch build, shards).
 - The ledger (`ledger.jsonl`), every leg's stdout and run log, and `report.txt` land in `--out`.
   `ab_stats.py --baseline 'ab_runs/X/baseline/*.txt' --candidate 'ab_runs/X/candidate/*.txt'` recomputes the report.

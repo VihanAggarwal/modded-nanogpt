@@ -1,6 +1,6 @@
 """The canonical-token mask (record #350), standalone: imports neither torch nor the trainer.
 
-canonical_mask.py runs this file as its own process (`python -I canonical_mask_build.py FD VOCAB`)
+canonical_mask.py runs this file as its own process (`python -P canonical_mask_build.py FD VOCAB`)
 to build the mask into the shared memory FD names, concurrently with training.
 """
 import mmap
@@ -124,6 +124,9 @@ def build_canonical_mask(vocab_size: int, ranks: dict | None = None) -> np.ndarr
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--check"]:  # the trainer's preflight, before the clock
+        tiktoken.get_encoding("gpt2")
+        sys.exit(0)
     fd, vocab_size = (int(arg) for arg in sys.argv[1:3])
     out = np.frombuffer(mmap.mmap(fd, vocab_size * (vocab_size // 8)), dtype=np.uint8)
     out[:] = build_canonical_mask(vocab_size).reshape(-1)

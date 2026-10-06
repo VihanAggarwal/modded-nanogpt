@@ -16,6 +16,7 @@ One staging object serves the training and validation loaders (created once in m
 Provenance: record #360 (ANVIL2): `_PinnedRing`, `_pinld_slot`, `_loader_pin_cap`, `_sgs_pinned_like`.
 #360 guards its rings with the CUDA-graph run-ahead throttle; here each slot has its own event.
 """
+import threading
 from dataclasses import dataclass
 
 import torch
@@ -44,18 +45,21 @@ class PinnedBatchStaging:
                                  torch.cuda.Event())
                       for _ in range(PINNED_BATCH_SLOTS)]
         self.next_slot = 0
+        # The training loader and train_gpt.py's loader thread (step 0's fetch, the val reads) share the ring.
+        self.lock = threading.Lock()
 
     def upload(self, inputs: Tensor, targets: Tensor, cum_seqlens: Tensor, ngram_ids: Tensor) -> tuple[Tensor, ...]:
         """Device copies of one batch's host tensors, through the next pinned slot."""
-        slot = self.slots[self.next_slot]
-        self.next_slot = (self.next_slot + 1) % PINNED_BATCH_SLOTS
-        slot.uploaded.synchronize()
-        out = []
-        for host, buf in ((inputs, slot.inputs), (targets, slot.targets), (cum_seqlens, slot.cum_seqlens),
-                          (ngram_ids, slot.ngram_ids)):
-            n = host.numel()
-            assert n <= buf.numel() and host.dtype == buf.dtype, f"batch tensor {host.dtype}[{n}] overflows its pinned slot"
-            buf[:n].copy_(host)
-            out.append(buf[:n].to(self.device, non_blocking=True))
-        slot.uploaded.record()
-        return tuple(out)
+        with self.lock:
+            slot = self.slots[self.next_slot]
+            self.next_slot = (self.next_slot + 1) % PINNED_BATCH_SLOTS
+            slot.uploaded.synchronize()
+            out = []
+            for host, buf in ((inputs, slot.inputs), (targets, slot.targets), (cum_seqlens, slot.cum_seqlens),
+                              (ngram_ids, slot.ngram_ids)):
+                n = host.numel()
+                assert n <= buf.numel() and host.dtype == buf.dtype, f"batch tensor {host.dtype}[{n}] overflows its pinned slot"
+                buf[:n].copy_(host)
+                out.append(buf[:n].to(self.device, non_blocking=True))
+            slot.uploaded.record()
+            return tuple(out)
