@@ -19,6 +19,7 @@ code = read_source(sys.argv[0])
 import copy
 import gc
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
@@ -134,6 +135,13 @@ def main():
 
     def val_loader():
         return distributed_data_generator(args.val_files, args.val_batch_size, -1, batch_staging, align_to_bos=False)
+
+    assert args.val_tokens % args.val_batch_size == 0
+    val_steps = args.val_tokens // args.val_batch_size
+
+    def read_val_batches():
+        val_loader_iter = val_loader()
+        return [next(val_loader_iter) for _ in range(val_steps)]
 
     training_schedule = TrainingSchedule(
         TRAINING_STAGES, args.num_scheduled_iterations, args.num_extension_iterations, device=env.device,
@@ -294,6 +302,13 @@ def main():
     # is started below the clock, so its whole cost -- not just its use -- lands in the timed region.
     canon_mask_builder = BackgroundCanonicalMask(model.vocab_size, owner=env.master_process, print0=print0)
 
+    # Loader work off the main thread, on the clock: step 0's batch (the first shard's read and index)
+    # under the prefix-table build at the clock's start, and each validation's batches under the GPU
+    # draining the training steps and the validation's own preparation. Started off the clock. The
+    # current CUDA device is per thread: the uploads record their slot events on this rank's device.
+    loader_thread = ThreadPoolExecutor(max_workers=1, initializer=torch.cuda.set_device, initargs=(env.device,))
+    loader_thread.submit(int).result()
+
     # No cyclic GC inside the timed loop: a multi-ms generation-2 pause on one rank stalls every rank at
     # the next collective. What survives until now is frozen out of all future scans; the garbage the
     # loop makes is collected at each validation, with the clock stopped (record #360).
@@ -310,6 +325,8 @@ def main():
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     canon_mask_builder.start()
+    # The loader is lazy: its first fetch reads the first shard. Started now, it overlaps the table build.
+    first_batch = loader_thread.submit(batches.peek, 0)
     # Prefix-token table build, inside the timed region. The tokenizer was loaded at import
     # (get_encoding is cached in tiktoken's registry), so this pays only the table construction,
     # split across ranks: each builds one token bucket and the max over ranks is the whole table.
@@ -318,12 +335,20 @@ def main():
     dist.all_reduce(model.prefix_table, op=dist.ReduceOp.MAX)
     # The candidate build maps prefix targets on the host.
     sampled_softmax.set_prefix_table(model.prefix_table.cpu().numpy())
+    first_batch.result()
     # begin training
     for step in range(training_schedule.total_steps + 1):
         last_step = (step == training_schedule.total_steps)
         training_manager.advance_schedule(step)
         # --------------- VALIDATION SECTION -----------------
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+            if last_step:
+                # Training is over: release its loader, so the two shards it holds go back to PyTorch's
+                # pinned-memory cache, where the val shard's read finds a buffer instead of paying a
+                # fresh 256 MB cudaHostAlloc on the clock.
+                batches.close()
+            # The val reads start now, on the loader thread; collected below, before the n-gram pulls.
+            val_batches = loader_thread.submit(read_val_batches)
             # The deferred gathers land first: validation reads the banks and, at the last step, ships
             # into them.
             if last_step:
@@ -347,11 +372,7 @@ def main():
             # On the clock (record #360): the table has no replica, so reading the val batches and pulling
             # their n-gram rows is part of the run's cost. The cache holds one batch, so the untimed loop
             # below lands each batch's rows again (same routes, no new exchange) right before its forward.
-            assert args.val_tokens % args.val_batch_size == 0
-            val_steps = args.val_tokens // args.val_batch_size
-            val_loader_iter = val_loader()
-            val_batches = [next(val_loader_iter) for _ in range(val_steps)]
-            del val_loader_iter
+            val_batches = val_batches.result()
             val_pulls = ngram_table.eval_pulls([batch.ngram_ids for batch in val_batches])
             for pull in val_pulls:
                 ngram_table.land(pull)
