@@ -86,15 +86,17 @@ class Shard:
         self.world_size = world_size
         self.i = 0
 
-        # Partial index now, full index async
-        self.bos_idx = (tokens[:6_000_000] == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+        # Partial index now, full index async. numpy's flatnonzero gives the same ascending int64 indices
+        # as torch's nonzero, ~4x faster single-threaded (the partial index of the timed run's first
+        # shard is on the clock, ahead of step 0).
+        self.bos_idx = np.flatnonzero(tokens.numpy()[:6_000_000] == BOS_ID)
         self._full_idx = None
         self._ready = threading.Event()
         self._loader_thread = threading.Thread(target=self._scan)
         self._loader_thread.start()
 
     def _scan(self):
-        self._full_idx = (self.tokens == BOS_ID).nonzero(as_tuple=True)[0].to(torch.int64).cpu().numpy()
+        self._full_idx = np.flatnonzero(self.tokens.numpy() == BOS_ID)
         self._ready.set()
 
     def _maybe_switch(self):
@@ -277,3 +279,7 @@ class ScheduledBatches:
         assert next(iter(self.ahead)) == step, f"step {step} taken out of order"
         del self.ahead[step]
         return batch
+
+    def close(self):
+        """Close the loader, releasing the shards it holds (the batches already fetched stay valid)."""
+        self.loader.close()
