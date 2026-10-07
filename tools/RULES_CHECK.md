@@ -27,6 +27,11 @@ functions, one call per site) and its optimizer entry in `track_1_short/training
 techniques. The record already has smear, the n-gram table, value embeddings and the partial key offset, which
 cover part of the same short-range mixing, so expect much less here. **Nothing below has run on a GPU.**
 
+**Proxy round 3 says no** (`tools/proxy/README.md`, Results): on a record-like base Canon gains -24.8 ± 6.0
+millinats at 1200 steps but loses +16.3 ± 7.4 at 3600 (the change, +41 ± 5, is p = 0.004). The record trains on far
+more tokens than either, so the flag stays off and `sweep_canon.sh` is not worth 8xH100 time unless a form whose
+gain holds at longer horizons turns up.
+
 With the flag unset nothing changes. A one-off CPU check against the commit before the patch (`e441d6d`) found the
 same parameters, RNG stream, optimizer tables (CPLM on and off), eval loss, gradients and traced eval graphs.
 `tools/tests/test_canon_layers.py` covers the flag on against off, and the layers themselves. Its forward and gradient

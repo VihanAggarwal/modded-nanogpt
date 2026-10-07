@@ -2,6 +2,7 @@
 # Canon layers (CANON_LAYERS, track_1_short/model/gpt.py) on one 8xH100 node: which sites pay for themselves, and
 # can they buy a step cut? Every arm is this checkout; only the environment differs. Run from a checkout of this
 # branch:  bash tools/speedrun_ab/sweep_canon.sh
+# Proxy round 3 found Canon's gain reverses with 3x the steps (tools/proxy/README.md): not worth running as is.
 # Warm caches; 4 legs x 8 arms x ~2 min plus one compile per arm: ~2 h. LEGS=6 for tighter numbers.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/../.." && pwd)

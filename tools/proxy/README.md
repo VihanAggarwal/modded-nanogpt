@@ -18,6 +18,29 @@ with `FIRST_SEED = 2` for twice the seeds in the same time. Paste the Summary ce
 - `nanogpt_proxy_screen.ipynb` (rounds 1-2): the record's own techniques as calibration, plus new candidates,
   then the winners re-tested on a stack of the calibration winners.
 
+## Results
+
+Round 3 (`results/round3_canon.jsonl`: RTX PRO 6000, 4 seeds over two copies, paired by seed; mnat of val loss
+against REC, negative is better; same-seed GPU replicates differ by ~2 mnat, residual noise ~9 mnat per run):
+
+| arm | 1200 steps | ms/step x |
+|---|---|---|
+| canon (A+C, k=4) | -24.8 ± 6.0 | 1.11 |
+| canon_c (MLP input only) | -23.6 ± 0.9 | 1.05 |
+| canon_a (attention input only) | +6.7 ± 5.2 | 1.06 |
+| canon_k2 | -29.8 ± 3.7 | 1.04 |
+| canon_renorm / canon_prenorm | -24.1 ± 3.5 / -19.4 ± 1.9 | 1.19 / 1.16 |
+| canon_bk (learned key offset) | -2.6 ± 3.1 | 1.03 |
+| v_shift | +4.5 ± 9.9 | 1.03 |
+| trigram_hash + canon, against trigram_hash | -40.4 ± 5.5 | 1.08 |
+
+**At 3x the steps (3600, 59M tokens) Canon's gain reverses: +16.3 ± 7.4 mnat** against REC, a change of
++41.2 ± 5.2 from 1200 steps (p = 0.004, the same sign in all four seeds). Canon here speeds up early training and
+then falls behind. The record trains on ~5x the tokens of the long arm, so Canon in this form is not a candidate
+for it. The same horizon bias runs the other way for hashed n-gram tables (`trigram_hash` +12 mnat at 1200 steps,
+yet the record's n-gram table is one of its biggest wins): a win or loss at 1200 steps says little about the
+record. Check any new idea at two horizons and keep only those whose gain holds or grows with steps.
+
 Regenerate both after editing `proxy_gpt.py`: `python tools/proxy/make_notebook.py`. Run keys carry a per-notebook
 prefix, so results of different notebooks and rounds never mix. Tests (CPU, ~15 s):
 `python -m pytest tools/proxy/test_proxy.py -q`.
