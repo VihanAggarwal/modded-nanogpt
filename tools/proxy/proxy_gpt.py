@@ -3,8 +3,10 @@
 The record's trainer needs 8 H100s (FA3, fp8, an n-gram table sharded 8 ways). This is a compact GPT in the
 speedrun's style -- RoPE, QK-norm, ReLU^2, zero-init projections, untied head, logit softcap, Muon on the hidden
 matrices and Adam elsewhere -- that trains on the same FineWeb .bin shards on any single GPU (Colab works) or,
-tiny, on CPU. Each idea is a flag (see VARIANTS); every variant sees the same tokens in the same order, so
-differences in final val loss come from the idea (and seed noise: run >= 2 seeds).
+tiny, on CPU. Each idea is a flag (see VARIANTS); every variant sees the same tokens in the same order, and under
+one seed every parameter it shares with the baseline starts the same (optional parameters draw no random numbers;
+swiglu, which reshapes the MLP, and tied, which re-draws the embedding, are the exceptions), so per-seed differences
+in val loss come from the idea (and trajectory noise: run >= 2 seeds, compare per seed).
 
 A proxy win is evidence, not proof: the record is ~124M params + an 84.6M-row n-gram table trained on ~330M
 tokens. Promote ideas that win clearly here to the 8xH100 sweep (tools/speedrun_ab).
@@ -23,6 +25,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch._dynamo.utils  # counters: graphs compiled per run
 
 # bf16 autocast where the GPU has bf16 tensor cores (A100, L4, H100); fp32 elsewhere (CPU, T4).
 AMP = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
@@ -72,10 +75,22 @@ class Config:
     mtp: float = 0.0              # weight of a t+2 prediction loss through the same head
     zloss: float = 0.0            # weight of the softmax normalizer z-loss
     qk_norm: bool = True
-    canon: bool = False           # Canon layers: zero-init causal depthwise conv (k=4) before attention and the MLP
+    canon: bool = False           # Canon layers: zero-init causal per-channel conv + residual on the sublayer inputs
+    canon_k: int = 4              # Canon kernel size (taps: the token itself and k-1 previous ones)
+    canon_sites: str = "AC"       # A: before attention, C: before the MLP
+    canon_norm: str = "post"      # post: conv(norm(x)) (the paper's); pre: norm(conv(x)); renorm: norm(conv(norm(x)))
+    canon_from_layer: int = 0     # no Canon on the layers below this one
+    canon_bk: bool = False        # Canon-B on the normed keys (k=4, every layer); starts as the key offset where on
+    v_shift: bool = False         # Canon-B on the values (k=4, zero-init, every layer)
+    key_offset: bool = False      # the record's partial key offset (#169): stationary key dims from the previous token
+    key_offset_layers: tuple = (2, 7)  # the record's long-window layers (3, 10 of 11), for 8 layers
     diff_attn: bool = False       # differential attention: softmax(q1 k1) - lambda softmax(q2 k2) on half-width q, k
     attn_scale: float = 0.0       # 0 = 1/sqrt(head_dim)
     tie_embed: bool = False
+    # measurement
+    tail_ema: float = 0.98        # >0: also evaluate an EMA of the weights over the last tail_frac of steps
+    tail_frac: float = 0.2
+    timing_warmup: int = 50       # steps excluded from the steady-state ms/step (compile, autotune, allocator)
     seed: int = 0
     compile: bool = False
 
@@ -86,6 +101,7 @@ class Config:
 # Each variant: what it changes relative to `baseline`. Add ideas here; keep them one flag or a few each.
 VARIANTS = {
     "baseline": {},
+    "rec_rep": {},  # no change: X+rec_rep re-runs X under the same seeds (its own run key): GPU nondeterminism
     "polar_express": {"orth": "polar"},
     "normuon": {"normuon": True},
     "cautious_wd": {"cautious_wd": True, "weight_decay": 0.025},
@@ -113,6 +129,16 @@ VARIANTS = {
     "ngram_gate": {"bigram_rows": 1 << 18, "ngram_gate": True},
     "canon": {"canon": True},
     "diff_attn": {"diff_attn": True},
+    "key_offset": {"key_offset": True},
+    "canon_a": {"canon": True, "canon_sites": "A"},
+    "canon_c": {"canon": True, "canon_sites": "C"},
+    "canon_k2": {"canon": True, "canon_k": 2},
+    "canon_k3": {"canon": True, "canon_k": 3},
+    "canon_prenorm": {"canon": True, "canon_norm": "pre"},   # the fp8-safe forms for the record (its static scales
+    "canon_renorm": {"canon": True, "canon_norm": "renorm"},  # assume normed inputs)
+    "canon_from1": {"canon": True, "canon_from_layer": 1},
+    "canon_bk": {"canon_bk": True},
+    "v_shift": {"v_shift": True},
 }
 
 
@@ -159,12 +185,33 @@ class Rotary(nn.Module):
         theta = torch.outer(torch.arange(max_len, dtype=torch.float32), freqs)
         self.register_buffer("cos", theta.cos(), persistent=False)
         self.register_buffer("sin", theta.sin(), persistent=False)
+        # dim i pairs with i + dim/2: the stationary dims are [dim/4, dim/2) and [3 dim/4, dim)
+        self.register_buffer("stationary", torch.cat([freqs, freqs]) == 0, persistent=False)
 
     def forward(self, x):  # [B, T, H, D]
         cos, sin = self.cos[None, :x.size(1), None, :].type_as(x), self.sin[None, :x.size(1), None, :].type_as(x)
         x1, x2 = x.float().chunk(2, dim=-1)
         x1, x2 = x1.type_as(x), x2.type_as(x)
         return torch.cat((x1 * cos + x2 * sin, -x1 * sin + x2 * cos), dim=-1)
+
+
+def canon(w: torch.Tensor, h: torch.Tensor, edge: bool = False) -> torch.Tensor:
+    """Canon layer as shift-and-sum: h[t] + sum_j w[j] * h[t - j], j = 0..k-1. Before the sequence start the taps
+    read zeros: a causal depthwise Conv1d whose weight is w.T.flip(-1)[:, None, :], with k-1 left padding. With
+    edge=True they read the first token instead, as the key offset does (token 0 keeps its own key).
+    w: [k, d] per-channel taps (w[0] weighs the token itself); h: [B, T, d]. Pointwise ops only: inductor fuses it
+    into one kernel."""
+    out = h + w[0] * h
+    for j in range(1, w.size(0)):
+        out = out + w[j] * (torch.cat([h[:, :1].expand(-1, j, -1), h[:, :-j]], dim=1) if edge
+                            else F.pad(h[:, :-j], (0, 0, j, 0)))
+    return out.type_as(h)
+
+
+def key_offset(k: torch.Tensor, stationary: torch.Tensor) -> torch.Tensor:
+    """The record's partial key offset (#169): every key's stationary dims come from the previous token's key
+    (token 0 keeps its own). k: [B, T, H, D], normed; stationary: [D] bool."""
+    return torch.where(stationary, torch.cat([k[:, :1], k[:, :-1]], dim=1), k)
 
 
 class Block(nn.Module):
@@ -182,21 +229,34 @@ class Block(nn.Module):
         self.rotary = Rotary(hd, cfg.seq_len)
         self.lambdas = nn.Parameter(torch.tensor([1.0, 0.0]))  # (x, x0) mix, used with x0_mix
         self.ve_lambda = nn.Parameter(torch.tensor(0.5))
+        # Optional parameters are built RNG-free (torch.zeros, never nn.Linear/nn.Conv1d + zeros_, whose constructors
+        # draw from the global RNG): every shared parameter then gets the same init under one seed in every variant.
         if cfg.attn_gate:
-            self.gate = nn.Linear(12, self.n_head, bias=False)
-            nn.init.zeros_(self.gate.weight)
-        if cfg.canon:  # depthwise, causal, zero-init: each block starts as before
-            self.canon_a = nn.Conv1d(d, d, 4, groups=d, bias=False)
-            self.canon_c = nn.Conv1d(d, d, 4, groups=d, bias=False)
-            nn.init.zeros_(self.canon_a.weight)
-            nn.init.zeros_(self.canon_c.weight)
+            self.attn_gate_w = nn.Parameter(torch.zeros(self.n_head, 12))
+        canon_here = cfg.canon and layer >= cfg.canon_from_layer  # depthwise, causal, zero-init: starts as before
+        self.canon_a = nn.Parameter(torch.zeros(cfg.canon_k, d)) if canon_here and "A" in cfg.canon_sites else None
+        self.canon_c = nn.Parameter(torch.zeros(cfg.canon_k, d)) if canon_here and "C" in cfg.canon_sites else None
+        self.canon_bv = nn.Parameter(torch.zeros(4, d)) if cfg.v_shift else None
+        self.key_offset = cfg.key_offset and layer in cfg.key_offset_layers
+        self.canon_bk = None
+        if cfg.canon_bk:  # replaces the hard key offset, starting as it (stationary dims: k - k + k[t-1])
+            w = torch.zeros(4, self.n_head, hd)
+            if self.key_offset:
+                w[0, :, self.rotary.stationary], w[1, :, self.rotary.stationary] = -1.0, 1.0
+            self.canon_bk, self.key_offset = nn.Parameter(w.view(4, d)), False
+        assert not (cfg.diff_attn and (cfg.key_offset or cfg.canon_bk)), "key offset, canon_bk: not with diff_attn"
         if cfg.diff_attn:
             self.rotary_half = Rotary(hd // 2, cfg.seq_len)
             self.diff_lambda = nn.Parameter(torch.tensor(0.2))
 
-    @staticmethod
-    def causal_conv(conv, h):
-        return h + conv(F.pad(h.transpose(1, 2), (conv.kernel_size[0] - 1, 0))).transpose(1, 2)
+    def sublayer_input(self, x, w):
+        """norm(x), through the Canon layer w (if any) where canon_norm puts it."""
+        if w is None:
+            return norm(x)
+        if self.cfg.canon_norm == "pre":
+            return norm(canon(w, x))
+        h = canon(w, norm(x))
+        return norm(h) if self.cfg.canon_norm == "renorm" else h
 
     def attend(self, q, k, v):
         """[B, T, H, D] -> [B, T, H, D] causal attention (differential if configured)."""
@@ -204,6 +264,10 @@ class Block(nn.Module):
         if not self.cfg.diff_attn:
             if self.cfg.qk_norm:
                 q, k = norm(q), norm(k)
+            if self.canon_bk is not None:  # Canon-B on the keys, before the rotary (as the paper's)
+                k = canon(self.canon_bk, k.flatten(2), edge=True).view_as(k)
+            elif self.key_offset:  # the stationary dims are the same before and after the rotary
+                k = key_offset(k, self.rotary.stationary)
             q, k = self.rotary(q), self.rotary(k)
             return F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
                                                   is_causal=True, scale=scale).transpose(1, 2)
@@ -220,20 +284,17 @@ class Block(nn.Module):
         if self.cfg.x0_mix:
             x = self.lambdas[0] * x + self.lambdas[1] * x0
         B, T, _ = x.shape
-        h = norm(x)
-        if self.cfg.canon:
-            h = self.causal_conv(self.canon_a, h)
+        h = self.sublayer_input(x, self.canon_a)
         q, k, v = self.qkv(h).view(B, T, 3, self.n_head, -1).unbind(2)
+        if self.canon_bv is not None:
+            v = canon(self.canon_bv, v.flatten(2)).view_as(v)
         if ve is not None:
             v = self.ve_lambda * v + (1 - self.ve_lambda) * ve.view_as(v)
         y = self.attend(q, k, v)
         if self.cfg.attn_gate:
-            y = y * torch.sigmoid(self.gate(h[..., :12]) + 2.0)[..., None]  # starts near open
+            y = y * torch.sigmoid(F.linear(h[..., :12], self.attn_gate_w) + 2.0)[..., None]  # starts near open
         x = x + self.proj(y.reshape(B, T, -1))
-        h = norm(x)
-        if self.cfg.canon:
-            h = self.causal_conv(self.canon_c, h)
-        h = self.fc(h)
+        h = self.fc(self.sublayer_input(x, self.canon_c))
         if self.cfg.act == "relu2":
             h = F.relu(h).square()
         elif self.cfg.act == "gelu":
@@ -249,27 +310,28 @@ class GPT(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.embed = nn.Embedding(VOCAB, cfg.d_model)
+        assert not cfg.key_offset or max(cfg.key_offset_layers) < cfg.n_layer, "key_offset_layers out of range"
+        assert set(cfg.canon_sites) <= {"A", "C"} and cfg.canon_norm in ("post", "pre", "renorm"), "unknown Canon form"
         self.blocks = nn.ModuleList(Block(cfg, i) for i in range(cfg.n_layer))
         self.head = nn.Linear(cfg.d_model, VOCAB, bias=False)
         nn.init.zeros_(self.head.weight)
         if cfg.tie_embed:
             nn.init.normal_(self.embed.weight, std=0.02)  # it is also the head now: small logits at init
             self.head.weight = self.embed.weight
-        self.ve = nn.ModuleList(nn.Embedding(VOCAB, cfg.d_model) for _ in range(cfg.value_embeds))
+        # Random optional tables draw from their own stream (seeded by cfg.seed), never from the global RNG.
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(cfg.seed + 1_000_003)
+            self.ve = nn.ModuleList(nn.Embedding(VOCAB, cfg.d_model) for _ in range(cfg.value_embeds))
         if cfg.unet:
             self.skip_w = nn.Parameter(torch.ones(cfg.n_layer // 2))
         if cfg.smear:
-            self.smear_gate = nn.Linear(12, 1, bias=False)
-            nn.init.zeros_(self.smear_gate.weight)
-        if cfg.bigram_rows:
-            self.bigram = nn.Embedding(cfg.bigram_rows, cfg.d_model)
-            nn.init.zeros_(self.bigram.weight)
+            self.smear_gate = nn.Parameter(torch.zeros(1, 12))
+        if cfg.bigram_rows:  # zero-init tables: plain zeros (nn.Embedding would draw rows x d normals first)
+            self.bigram = nn.Parameter(torch.zeros(cfg.bigram_rows, cfg.d_model))
         if cfg.trigram_rows:
-            self.trigram = nn.Embedding(cfg.trigram_rows, cfg.d_model)
-            nn.init.zeros_(self.trigram.weight)
+            self.trigram = nn.Parameter(torch.zeros(cfg.trigram_rows, cfg.d_model))
         if cfg.ngram_gate:
-            self.ngram_gate_w = nn.Linear(12, 1, bias=False)
-            nn.init.zeros_(self.ngram_gate_w.weight)
+            self.ngram_gate_w = nn.Parameter(torch.zeros(1, 12))
 
     def value_embed_for(self, layer: int, ves):
         # U-net pattern: table i feeds layer i and layer n_layer - 1 - i
@@ -285,15 +347,15 @@ class GPT(nn.Module):
         x = self.embed(idx)
         if cfg.bigram_rows:
             prev = F.pad(idx[:, :-1], (1, 0), value=BOS)
-            ngram = self.bigram((prev * 36313 + idx * 27191) % cfg.bigram_rows)
+            ngram = F.embedding((prev * 36313 + idx * 27191) % cfg.bigram_rows, self.bigram)
             if cfg.trigram_rows:
                 prev2 = F.pad(idx[:, :-2], (2, 0), value=BOS)
-                ngram = ngram + self.trigram((prev2 * 1000003 + prev * 36313 + idx * 27191) % cfg.trigram_rows)
+                ngram = ngram + F.embedding((prev2 * 1000003 + prev * 36313 + idx * 27191) % cfg.trigram_rows, self.trigram)
             if cfg.ngram_gate:  # starts open (2 * sigmoid(0) = 1): the gate learns what to trust
-                ngram = ngram * 2 * torch.sigmoid(self.ngram_gate_w(x[..., :12]))
+                ngram = ngram * 2 * torch.sigmoid(F.linear(x[..., :12], self.ngram_gate_w))
             x = x + ngram
         if cfg.smear:
-            x = torch.cat([x[:, :1], x[:, 1:] + torch.sigmoid(self.smear_gate(x[:, 1:, :12])) * x[:, :-1]], dim=1)
+            x = torch.cat([x[:, :1], x[:, 1:] + torch.sigmoid(F.linear(x[:, 1:, :12], self.smear_gate)) * x[:, :-1]], dim=1)
         x = x0 = norm(x)
         ves = [ve(idx) for ve in self.ve]
         skips = []
@@ -375,7 +437,9 @@ class Muon(torch.optim.Optimizer):
 
 
 def build_optimizers(model: GPT, cfg: Config):
-    hidden = [p for n, p in model.named_parameters() if p.ndim == 2 and "blocks" in n and "gate" not in n]
+    # the Canon taps (canon_a/c/bk/bv, [k, d]) stay on Adam with the scalars (lr_scalar, no weight decay), never Muon
+    hidden = [p for n, p in model.named_parameters() if p.ndim == 2 and "blocks" in n and "gate" not in n
+              and "canon" not in n]
     hidden_ids = {id(p) for p in hidden}
     embeds = [p for n, p in model.named_parameters() if ("embed" in n or n.startswith("ve.") or "gram" in n)
               and "gate" not in n and id(p) not in hidden_ids]
@@ -422,16 +486,35 @@ def evaluate(model: GPT, val: np.ndarray, cfg: Config, device) -> float:
     return sum(losses) / n
 
 
+_COMPILED_FOR = None  # the config (seed aside) whose graphs dynamo holds now
+
+
 def train(cfg: Config, data_dir: str, device, log_every: int = 100) -> dict:
+    global _COMPILED_FOR
+    if cfg.compile and _COMPILED_FOR != cfg.update(seed=0):
+        # Dynamo caches compiled graphs on GPT.forward's code object across runs, guarded on the cfg values the
+        # forward reads. At recompile_limit (8) distinct configs it stops compiling and runs every new config
+        # eagerly (2.7-3.5x slower), silently. Start each new config from an empty cache; seeds reuse it.
+        torch.compiler.reset()
+        _COMPILED_FOR = cfg.update(seed=0)
     torch.manual_seed(cfg.seed)
     model = GPT(cfg).to(device)
     opts = build_optimizers(model, cfg)
-    fwd = torch.compile(model) if cfg.compile else model
+    # fullgraph=True: a graph break or a recompile-limit hit raises instead of falling back to eager
+    fwd = torch.compile(model, fullgraph=True) if cfg.compile else model
+    graphs0 = torch._dynamo.utils.counters["stats"]["unique_graphs"]
     stream = TrainStream(f"{data_dir}/fineweb_train_*.bin", cfg.seq_len)
     # Snoo: slow weights take a Nesterov step toward the fast weights every snoo_every steps; fast restart there.
     slow = [p.detach().clone() for p in model.parameters()] if cfg.snoo_every else None
     outer_m = [torch.zeros_like(p) for p in model.parameters()] if cfg.snoo_every else None
     val = load_tokens(sorted(glob.glob(f"{data_dir}/fineweb_val_*.bin"))[0], cfg.val_tokens + 1)
+    sync = torch.cuda.synchronize if device.type == "cuda" else (lambda: None)
+    params = [p for p in model.parameters()]
+    ema, ema_start = None, int(cfg.steps * (1 - cfg.tail_frac)) if cfg.tail_ema else cfg.steps
+    # steady-state timing: steps (warm, stop], after compile/autotune warmup and before the tail EMA starts
+    stop = min(ema_start, cfg.steps) - 1
+    warm = max(0, min(cfg.timing_warmup, stop - 1))
+    t_first = t_warm = t_stop = None
     t0 = time.perf_counter()
     for step in range(cfg.steps):
         chunk = stream.next(cfg.batch_seqs).to(device, non_blocking=True)
@@ -453,15 +536,38 @@ def train(cfg: Config, data_dir: str, device, log_every: int = 100) -> dict:
                     m.mul_(cfg.snoo_momentum).add_(delta)
                     s.add_(delta + cfg.snoo_momentum * m, alpha=cfg.snoo_lr)
                     p.copy_(s)
+        if step >= ema_start:  # tail EMA of the weights (the record ends on tail averages too)
+            with torch.no_grad():
+                if ema is None:
+                    ema = [p.detach().float().clone() for p in params]
+                else:
+                    torch._foreach_lerp_(ema, [p.detach().float() for p in params], 1 - cfg.tail_ema)
+        if step == 0:
+            sync(); t_first = time.perf_counter()
+        if step == warm:
+            sync(); t_warm = time.perf_counter()
+        if step == stop:
+            sync(); t_stop = time.perf_counter()
         if log_every and (step + 1) % log_every == 0:
             print(f"  step {step + 1}/{cfg.steps} train loss {loss.item():.4f} ({time.perf_counter() - t0:.0f}s)", flush=True)
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    seconds = time.perf_counter() - t0
+    sync()
+    t_end = time.perf_counter()
+    graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"] - graphs0
     val_loss = evaluate(model, val, cfg, device)
+    val_loss_ema = None
+    if ema is not None:
+        with torch.no_grad():
+            for p, e in zip(params, ema):
+                p.copy_(e)
+        val_loss_ema = evaluate(model, val, cfg, device)
+    ms_per_step = 1000 * (t_stop - t_warm) / max(1, stop - warm)
     tokens = cfg.steps * cfg.batch_seqs * cfg.seq_len
-    return dict(val_loss=val_loss, seconds=seconds, tokens_per_s=tokens / seconds,
-                params_m=sum(p.numel() for p in model.parameters()) / 1e6)
+    return dict(val_loss=val_loss, val_loss_ema=val_loss_ema,
+                seconds=t_end - t0,                 # total, as before: includes compile and warmup
+                first_step_s=t_first - t0,          # mostly compile
+                ms_per_step=ms_per_step,            # steady state: after timing_warmup, before the tail EMA
+                tokens_per_s=cfg.batch_seqs * cfg.seq_len / (ms_per_step / 1000), tokens=tokens,
+                compiled_graphs=graphs, params_m=sum(p.numel() for p in model.parameters()) / 1e6)
 
 
 def main():
@@ -478,7 +584,11 @@ def main():
     for kv in args.set:
         key, _, value = kv.partition("=")
         kind = type(getattr(base, key))
-        base = base.update(**{key: (value.lower() in ("1", "true")) if kind is bool else kind(value)})
+        if kind is bool:
+            value = value.lower() in ("1", "true")
+        else:  # a tuple is comma-separated ints, e.g. key_offset_layers=2,5
+            value = tuple(int(v) for v in value.split(",")) if kind is tuple else kind(value)
+        base = base.update(**{key: value})
     results = {}
     for name in args.variants.split(","):
         changes = {}
@@ -492,15 +602,15 @@ def main():
             with open(args.out, "a") as f:
                 f.write(json.dumps(r) + "\n")
             results.setdefault(name, []).append(r)
-            print(f"   val {r['val_loss']:.4f}  {r['seconds']:.0f}s  {r['tokens_per_s'] / 1e3:.0f}k tok/s  "
-                  f"{r['params_m']:.1f}M params", flush=True)
+            print(f"   val {r['val_loss']:.4f}  ema {r['val_loss_ema'] or float('nan'):.4f}  "
+                  f"{r['ms_per_step']:.1f} ms/step  {r['seconds']:.0f}s  {r['params_m']:.1f}M params", flush=True)
     base_val = np.mean([r["val_loss"] for r in results[next(iter(results))]])
-    base_s = np.mean([r["seconds"] for r in results[next(iter(results))]])
-    print(f"\n{'variant':>28} {'val':>8} {'+/-':>7} {'d val (mnat)':>12} {'time x':>7}")
+    base_ms = np.mean([r["ms_per_step"] for r in results[next(iter(results))]])
+    print(f"\n{'variant':>28} {'val':>8} {'+/-':>7} {'d val (mnat)':>12} {'ms/step x':>9}")
     for name, rs in sorted(results.items(), key=lambda kv: np.mean([r["val_loss"] for r in kv[1]])):
         vals = [r["val_loss"] for r in rs]
         print(f"{name:>28} {np.mean(vals):8.4f} {np.std(vals, ddof=1) if len(vals) > 1 else float('nan'):7.4f} "
-              f"{1000 * (np.mean(vals) - base_val):+12.1f} {np.mean([r['seconds'] for r in rs]) / base_s:7.2f}")
+              f"{1000 * (np.mean(vals) - base_val):+12.1f} {np.mean([r['ms_per_step'] for r in rs]) / base_ms:9.3f}")
     print("(d val: vs the first variant listed; at the record's rate, 1 mnat ~ 164 ms of 8xH100 time, before any"
           " per-step cost the idea adds)")
 
