@@ -39,3 +39,18 @@ python cand/tools/speedrun_ab/ab_bench.py --arm baseline=base --arm candidate=ca
 - **interval table**: mean ms per logged 25-step interval and for the final validation. Every interval
   after the first has an sd of about 1-3 ms, so a change shows up in the intervals it touched. The
   systems patches on this branch target steps `0-25` (startup) and the `...-val` row (final validation).
+
+## Sweeps of one checkout
+
+With more than two arms, `ab_bench.py` reports one row per arm against the first. Arms may share a directory
+and differ only by `--arm-env NAME:KEY=VALUE` (repeat it for several variables).
+
+- `sweep_stack.sh`: the stack (systems patches + #375 + #379) against master and #379 alone, at 978, 963 and 950
+  scheduled steps.
+- `sweep_canon.sh`: Canon layers (`CANON_LAYERS`, `track_1_short/model/gpt.py`; off by default) against the stack
+  with the flag off (`stack978`): sites A+C, A only, C only, A+C at 950 steps, and A+C with `CANON_LAYERS_NORM=renorm`,
+  with 3x the taps' lr (`CANON_LAYERS_LR_MUL=3`) or with `CANON_LAYERS_BOS_MASK=1`.
+  At equal steps, `d wall ms` is the layers' cost per run; `d adj ms` nets cost against the val change at 164 ms per
+  millinat. The script's comments give the `PROFILE_STEPS` runs that split the cost per step by kernel. None of
+  these arms has run on a GPU yet. Any arm that wins changes the ML, so it needs its own p < 0.01 pool
+  (`tools/RULES_CHECK.md`).

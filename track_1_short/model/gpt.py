@@ -25,7 +25,7 @@ from track_1_short.perf.kernels.mlp import (
 from track_1_short.perf.kernels.ngram_embed import ngram_embedding
 from track_1_short.perf.kernels.sampled_cross_entropy import SampledSoftcappedCrossEntropy
 from track_1_short.perf.kernels.value_embed import value_embed_lookup
-from track_1_short.perf.residual_fusion import rms_norm_with_head, scale, scale_add
+from track_1_short.perf.residual_fusion import RMS_NORM_EPS, rms_norm_with_head, scale, scale_add
 from track_1_short.sampled_softmax import SampledLoss
 from track_1_short.token_norm import NORM_MAP
 
@@ -108,6 +108,36 @@ NUM_MLP_SLOTS = 12
 # MLP hidden size, cut from 4 * 768 = 3072 in record #360.
 MLP_HIDDEN_DIM = 2816
 
+# Canon layers (Allen-Zhu 2025, Physics of Language Models Part 4.1; unrelated to canon_mask, the canonical-
+# tokenization mask). Off unless CANON_LAYERS is set; off, they add no parameter and no op. A site adds a causal
+# depthwise conv to a sublayer's input h: h[t] + sum_j w[j] * h[t - j], j < K. Its taps (canon_layer_taps) start at
+# zero, drawing no RNG, so training starts from exactly the model without them; replicated Adam, no weight decay.
+#   CANON_LAYERS: the sites, A (attention input: layers 0, 1, 2, 3, 5, and 8, whose input norm(cache[7]) layer 10
+#     reuses) and/or C (MLP input: every layer with an MLP; layer 8's parallel MLP shares it), e.g. "AC". The
+#     post-loop MUDD mix reads layer 10's two inputs after their Canon layers; the value-embedding gates read the
+#     normed attention input before its Canon layer.
+#   CANON_LAYERS_K: taps per channel, 4 as in the paper (Primer's search picked 3).
+#   CANON_LAYERS_LR_MUL: the taps' Adam lr multiplier (training.py). The proxy's lr was 0.02; here it is 0.008 times
+#     the schedule, with Adam stepping every other step.
+#   CANON_LAYERS_NORM: where the conv sits relative to the sublayer's RMS norm.
+#     post (the paper's and the proxy's): conv(norm(x)). It scales a channel's entries by up to a = |1 + w[0]| +
+#       sum_j>0 |w[j]|, which nothing bounds (no weight decay), so the training forward's static fp8 scales clamp
+#       entries (never NaN) that the bf16 validation forward keeps. MLP input: past 28 (FP8_MLP_X_SCALE assumes |h|
+#       <= sqrt(768) = 27.7), possible once one of the K rows' channels holds (28 / a)^2 / 768 of that row's energy
+#       (a quarter at a = 2). Attention input: past 8 (FP8_ATTN_X_SCALE), possible from entries past 8 / a.
+#     renorm: post, each row then scaled back to norm(x)'s RMS, so the bound is exact (one more row reduction).
+#     pre: norm(conv(x)), on the residual stream (bound exact; neighbours weigh by their residual norms).
+#   CANON_LAYERS_BOS_MASK=1: no tap reaches across a BOS (off: like smear, the n-gram hashes, the paper and the proxy).
+CANON_LAYERS = os.environ.get("CANON_LAYERS", "")
+CANON_LAYERS_K = int(os.environ.get("CANON_LAYERS_K", "4"))
+CANON_LAYERS_NORM = os.environ.get("CANON_LAYERS_NORM", "post")
+CANON_LAYERS_BOS_MASK = bool(CANON_LAYERS) and os.environ.get("CANON_LAYERS_BOS_MASK") == "1"
+CANON_LAYERS_LR_MUL = float(os.environ.get("CANON_LAYERS_LR_MUL", "1"))
+CANON_LAYERS_A = (0, 1, 2, 3, 5, 8) if "A" in CANON_LAYERS else ()
+CANON_LAYERS_C = tuple(i for i in range(NUM_LAYERS) if i not in NO_MLP_LAYERS) if "C" in CANON_LAYERS else ()
+assert set(CANON_LAYERS) <= {"A", "C"}, f"CANON_LAYERS={CANON_LAYERS!r}: the sites, A and/or C"
+assert CANON_LAYERS_K >= 1 and CANON_LAYERS_NORM in ("post", "renorm", "pre")
+
 # Static FP8 scales of the attention projection's input (e4m3, saturates entries beyond |8|) and of
 # its incoming gradient, both from record #360.
 FP8_ATTN_X_SCALE = 8.0 / 448.0
@@ -165,6 +195,39 @@ FP8_EXACT_SCALE_CALLS = 16
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
+
+def canon_layer_conv(h: Tensor, w: Tensor, keep: tuple[Tensor, ...] | None = None, renorm: bool = False) -> Tensor:
+    """h[t] + sum_j w[j] * h[t - j] over j < K, zero before the sequence start; h [1, T, D], w [K, D] fp32 (the tap
+    layout of tools/proxy/proxy_gpt.py's canon()). Shift-and-sum, as F.conv1d would stay an extern kernel. Each shift
+    is a roll and a mask, which the backward recomputes from h; an F.pad shift it would save, an fp32 [T, D] copy per
+    tap. w == 0 returns h bitwise, renorm or not."""
+    hf = h.float()
+    y = hf * (1 + w[0])
+    t = torch.arange(h.size(1), device=h.device)[None, :, None]
+    for j in range(1, w.size(0)):
+        shifted = torch.where(t >= j, hf.roll(j, 1), 0.0)
+        y = y + w[j] * (shifted if keep is None else shifted * keep[j - 1])
+    if renorm:  # each row back to h's RMS (~1: h is normed); the ratio is exactly 1 at w == 0
+        mean_sq = lambda u: u.square().mean(-1, keepdim=True) + RMS_NORM_EPS
+        y = y * (mean_sq(hf) / mean_sq(y)).sqrt()
+    return y.type_as(h)
+
+def canon_layer_bos_keep(input_seq: Tensor, k: int) -> tuple[Tensor, ...]:
+    """keep[j - 1], [1, T, 1] fp32: 1 where token t - j is in token t's document (no BOS among t - j + 1 .. t)."""
+    not_bos = (input_seq != 50256).float()  # data.BOS_ID
+    keep, run = [], torch.ones_like(not_bos)
+    for j in range(1, k):
+        run = run * F.pad(not_bos[:not_bos.numel() - (j - 1)], (j - 1, 0), value=1.0)
+        keep.append(run[None, :, None])
+    return tuple(keep)
+
+def canon_layer_site(x: Tensor, x_normed: Tensor, w: Tensor | None, keep: tuple[Tensor, ...] | None) -> Tensor:
+    """A sublayer's input: x_normed (= norm(x)), through its Canon layer w if it has one (pre: x_normed is unused)."""
+    if w is None:
+        return x_normed
+    if CANON_LAYERS_NORM == "pre":
+        return norm(canon_layer_conv(x, w, keep))
+    return canon_layer_conv(x_normed, w, keep, renorm=CANON_LAYERS_NORM == "renorm")
 
 @dataclass(slots=True)
 class ForwardScheduleConfig:
@@ -234,6 +297,10 @@ class GPT(nn.Module):
         self.init_misc(model_dim, num_layers)
         self.init_mudd(num_layers, model_dim)
         self.init_mudd_gate(model_dim)
+        if CANON_LAYERS:
+            # Canon layers: one [K, model_dim] filter per site, A sites first; stays fp32 (cast_matrix_weights_bf16).
+            num_sites = len(CANON_LAYERS_A) + len(CANON_LAYERS_C)
+            self.canon_layer_taps = nn.Parameter(torch.zeros(num_sites, CANON_LAYERS_K, model_dim))
 
         # CPLM (env CPLM=1): copy-sink pointer, K=1 head of dim CPLM_DIM over the final hidden state, plus a
         # learned sink key. <copy> is the first padding row of the vocab, so lm_head needs no new rows.
@@ -681,6 +748,15 @@ class GPT(nn.Module):
         mlp_all = self.mlp_bank.flatten(0, 1).unbind(0)  # 24 tensors of [mlp_hdim, dim]
         mlp_fcs = mlp_all[0::2]    # even indices: c_fc
         mlp_projs = mlp_all[1::2]  # odd indices: c_proj
+        canon_layer_a = [None] * self.num_layers  # Canon layer filters by layer: canon_layer_taps' A rows, then C rows
+        canon_layer_c = [None] * self.num_layers
+        if CANON_LAYERS:
+            taps = self.canon_layer_taps.unbind(0)
+            for layer, w in zip(CANON_LAYERS_A, taps):
+                canon_layer_a[layer] = w
+            for layer, w in zip(CANON_LAYERS_C, taps[len(CANON_LAYERS_A):]):
+                canon_layer_c[layer] = w
+        canon_layer_keep = canon_layer_bos_keep(input_seq, CANON_LAYERS_K) if CANON_LAYERS_BOS_MASK else None
 
         # ---- Embeddings and input preparation ----
         x = self.embed(input_seq) # embed is synced from lm_head during tied phase by optimizer
@@ -729,8 +805,9 @@ class GPT(nn.Module):
         # cache[k] is the layer-k snapshot used downstream by MUDD.
         # cache[0] = residual stream after bigram injection (input to layer 0).
         cache = {0: x}
-        # (norm(cache[7]), its fp8 copy): every attention layer after layer 7 reads this same input,
-        # so it is normed, and in fp8 quantized, once and shared. The post-loop mix reads it too.
+        # (norm(cache[7]) through layer 8's Canon layer if any, its fp8 copy): every attention layer after
+        # layer 7 reads this same input, so it is normed, and in fp8 quantized, once and shared. The post-loop
+        # mix reads it too.
         late_attn_in = None
         for i in range(self.num_layers):
             c_fc = mlp_fcs[i]
@@ -759,6 +836,7 @@ class GPT(nn.Module):
                         attn_in_normed, ve_gate_head = rms_norm_with_head(attn_in, VALUE_EMBED_GATE_CHANNELS)
                     else:
                         attn_in_normed = norm(attn_in)
+                    attn_in_normed = canon_layer_site(attn_in, attn_in_normed, canon_layer_a[i], canon_layer_keep)
                     attn_x_f8 = None
                     if use_fp8:
                         attn_x_f8 = quantize_dual_layout_fused(attn_in_normed.detach().view(-1, attn_in_normed.size(-1)),
@@ -825,7 +903,7 @@ class GPT(nn.Module):
                 if i in CACHE_LAYERS:
                     cache[i] = x
                 continue
-            mlp_in = norm(x)
+            mlp_in = canon_layer_site(x, norm(x), canon_layer_c[i], canon_layer_keep)
             # fp8 only: the post-lambda is folded into the down-projection scale, so the MLP output
             # already carries it. Not on the MUDD layer, whose post-lambda mu[13] is per-token.
             fold_p = post_lambdas_mlp[i] if use_fp8 and mu is None else None
@@ -854,7 +932,7 @@ class GPT(nn.Module):
 
         # Post-loop MUDD: mix 10 earlier activations back into the residual, each with a per-token
         # coefficient plus a per-channel-group delta. The last two are the final layer's MLP input and
-        # its attention input, norm(cache[7]).
+        # its attention input, norm(cache[7]) (both after their Canon layers if any).
         assert late_attn_in is not None, "norm(cache[7]) is not bound at loop exit"
         sources = [
             cache[0], cache[7], cache[9], ve[1][None].to(dtype=x.dtype), cache[3],

@@ -5,7 +5,7 @@ from collections.abc import Callable
 import torch
 
 from track_1_short.config import BLOCK_SIZE, VIRTUAL_SEQ_CAP
-from track_1_short.model.gpt import ForwardScheduleConfig
+from track_1_short.model.gpt import CANON_LAYERS, CANON_LAYERS_LR_MUL, ForwardScheduleConfig
 from track_1_short.ngram_table import NGRAM_ADAM_PERIOD4_START
 from track_1_short.optim.anvil import RAIL_ENGAGE_STEP, RAIL_FAST_BETA, RAIL_FAST_WEIGHT, AnvilAndAdam, AnvilBank
 from track_1_short.perf.row_prefetch import RowPrefetch
@@ -132,6 +132,11 @@ class TrainingManager():
                 self.work_order.insert(self.work_order.index("copy_k_sink") + 1, "copy_gate")
             if "copy_qk_gain" in self.param_table:
                 self.work_order.insert(self.work_order.index("copy_k_sink") + 1, "copy_qk_gain")
+        if CANON_LAYERS:  # Canon layers' filters (model/gpt.py): replicated, updated with the other replicated params
+            self.param_table["canon_layer_taps"] = {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99],
+                                                    "lr_mul": CANON_LAYERS_LR_MUL, "wd_mul": 0.0}
+            self.scatter_order.append("canon_layer_taps")
+            self.work_order.insert(self.work_order.index("resid_lambdas") + 1, "canon_layer_taps")
 
         self.adam_defaults = adam_defaults = dict(
             lr=0.008,
