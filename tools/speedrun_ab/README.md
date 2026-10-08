@@ -30,6 +30,14 @@ python cand/tools/speedrun_ab/ab_bench.py --arm baseline=base --arm candidate=ca
 - `--dry-run` prints the plan and the preflight checks (GPU count, driver, torch build, shards).
 - The ledger (`ledger.jsonl`), every leg's stdout and run log, and `report.txt` land in `--out`.
   `ab_stats.py --baseline 'ab_runs/X/baseline/*.txt' --candidate 'ab_runs/X/candidate/*.txt'` recomputes the report.
+- Re-running the same command with the same `--out` resumes it: legs in the ledger never run again, and a different
+  plan for that `--out` is refused (`plan.json`). A leg cut short by a kill is moved to `interrupted/` and run again.
+- `--arm-legs NAME=N` gives one arm its own count (the record attempt's 12 + 6 + 6 pool), `--max-crashes 2` stops
+  after two crashed legs in a row of one arm (`--droppable NAME` drops that arm's remaining legs instead), and
+  `--leg-timeout S` kills a hung leg's whole process group (it counts as a crash unless its log has the final val).
+  Every leg's processes carry `AB_BENCH_OUT=<--out>` in their environment; whatever of a leg is still running after
+  it (torchrun's workers run in sessions of their own, or the bench was `kill -9`ed) is killed before the next leg.
+- `tools/record_attempt/run.sh` drives all of this for a full record attempt in one command.
 
 ## Reading the report
 
@@ -47,10 +55,3 @@ and differ only by `--arm-env NAME:KEY=VALUE` (repeat it for several variables).
 
 - `sweep_stack.sh`: the stack (systems patches + #375 + #379) against master and #379 alone, at 978, 963 and 950
   scheduled steps.
-- `sweep_canon.sh`: Canon layers (`CANON_LAYERS`, `track_1_short/model/gpt.py`; off by default) against the stack
-  with the flag off (`stack978`): sites A+C, A only, C only, A+C at 950 steps, and A+C with `CANON_LAYERS_NORM=renorm`,
-  with 3x the taps' lr (`CANON_LAYERS_LR_MUL=3`) or with `CANON_LAYERS_BOS_MASK=1`.
-  At equal steps, `d wall ms` is the layers' cost per run; `d adj ms` nets cost against the val change at 164 ms per
-  millinat. The script's comments give the `PROFILE_STEPS` runs that split the cost per step by kernel. None of
-  these arms has run on a GPU yet. Any arm that wins changes the ML, so it needs its own p < 0.01 pool
-  (`tools/RULES_CHECK.md`).

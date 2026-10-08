@@ -18,46 +18,11 @@ The rules (README "Rules"), and how this branch meets them. The branch is two la
 | D1 | Readability: the gain must justify the code | +318/-194 lines over upstream (net +124), about 120 of the added lines the mask build moved verbatim into its own torch-free module. | #379 brings ~750 lines of Triton plus ~30 environment knobs; maintainers will want the knobs stripped to its shipped configuration. |
 | D2 | Do not consume the 0.001-0.002 loss buffer unless it beats a plain step cut | No ML change, so the buffer is untouched. | The step count must keep the buffer (>= ~2 millinats under 3.28 on the pool mean). |
 
-## Candidate: Canon layers (`CANON_LAYERS`, off by default)
+## Tried and removed: Canon layers
 
-Canon layers (Allen-Zhu 2025, Physics of Language Models Part 4.1): a causal depthwise conv over 4 tokens, plus a
-residual, on each sublayer input. Here: `track_1_short/model/gpt.py` (one parameter, `canon_layer_taps`, three small
-functions, one call per site) and its optimizer entry in `track_1_short/training.py`. The proxy screen
-(`tools/proxy/`, 1200 steps of 16K tokens) measured -207 millinats alone and -48 / -92 on top of a stack of record
-techniques. The record already has smear, the n-gram table, value embeddings and the partial key offset, which
-cover part of the same short-range mixing, so expect much less here. **Nothing below has run on a GPU.**
-
-**Proxy round 3 says no** (`tools/proxy/README.md`, Results): on a record-like base Canon gains -24.8 ± 6.0
-millinats at 1200 steps but loses +16.3 ± 7.4 at 3600 (the change, +41 ± 5, is p = 0.004). The record trains on far
-more tokens than either, so the flag stays off and `sweep_canon.sh` is not worth 8xH100 time unless a form whose
-gain holds at longer horizons turns up.
-
-With the flag unset nothing changes. A one-off CPU check against the commit before the patch (`e441d6d`) found the
-same parameters, RNG stream, optimizer tables (CPLM on and off), eval loss, gradients and traced eval graphs.
-`tools/tests/test_canon_layers.py` covers the flag on against off, and the layers themselves. Its forward and gradient
-checks run with CPLM off (the copy head has no CPU stand-ins); with CPLM on, the record's default, only the optimizer
-tables are checked. The run log records the code, not the environment, so a `CANON_LAYERS` run's log reads like a
-flag-off one: hard-code the chosen setting before any pool.
-
-| | rule | Canon layers |
-|---|---|---|
-| 1 | Token stream | Unchanged. `data.py` is untouched; only the optional BOS mask reads the tokens, inside the forward. |
-| 2 | p < 0.01 | An ML change: it needs its own pool at the chosen setting, all runs counted. `tools/speedrun_ab/sweep_canon.sh` only picks the setting. |
-| 3 | No compile flags | None. The conv is plain shift-and-sum torch, compiled at the default settings (`F.conv1d` would stay an extern kernel). Each shift is a roll and a mask, which the backward recomputes; a CPU test checks that the compiled site keeps no fp32 copy of the shifted rows. How inductor fuses it on a GPU is not known yet. |
-| 4 | Faster | Not measured. Expected with stock inductor, for 16 sites: ~1 s per run (~6 millinats at 164 ms each). The conv reads neighbouring rows of the norm's output, so it cannot join the norm's per-row kernel, and the taps' gradient is a sum over tokens: about 3 extra passes over the rows per site. ~1.7 s if every op got its own kernel; ~0.04 s only with hand-written kernels that fold it into the norm and quantize. Measure with `PROFILE_STEPS` (see `sweep_canon.sh`). |
-| D1 | Readability | About +90 lines in the two files, a third of them comments. There are five knobs (sites, `_K`, `_NORM`, `_BOS_MASK`, `_LR_MUL`); the sweep has an arm for each but `_K`, which the proxy screens. A submission should keep only the winning setting. |
-| D2 | Loss buffer | The gain has to buy a step cut, not eat the buffer: the sweep's `canonAC950` arm runs 28 fewer scheduled steps. |
-
-Still to check on a GPU, before any pool:
-- At init, the compiled fp8 training step matches the flag-off run within rounding, with CPLM on.
-- Warmup capture, the self-check and the address census pass.
-- The cost per step.
-- Under the default `post`, per site and against flag off: max |input| and the share of entries the static fp8
-  scales clamp (past 28 in MLP inputs, past 8 in attention inputs; never NaN). A filter of gain a = |1 + w0| + sum
-  |wj| can clamp MLP entries once a channel holds (28 / a)^2 / 768 of its row's energy, and attention entries past
-  8 / a.
-  The bf16 validation forward does not clamp, so these widen the gap between training and validation.
-  `CANON_LAYERS_NORM=renorm` keeps each row's RMS, so the MLP bound stays exact.
+Canon layers (Allen-Zhu 2025) were added behind a flag (commit 3ae6b37) and screened on the one-GPU proxy: their
+gain on a record-like base reversed between 1200 and 3600 steps (`tools/proxy/README.md`, Results). The trainer code,
+its tests and its sweep were removed again, so no off-by-default Canon code ships in the logged source.
 
 ## What must stay on the clock
 

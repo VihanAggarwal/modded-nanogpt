@@ -89,7 +89,7 @@ def test_numpy_bos_indexes_equal_torch_nonzero(monkeypatch):
 
 
 @pytest.mark.parametrize("rank", [0, 5])
-@pytest.mark.parametrize("scheduled", [1122, 978])  # the record's schedule (1194 steps) and the stack's (1050)
+@pytest.mark.parametrize("scheduled", [1122, 978, 963])  # the record's (1194 steps), the stack's (1050) and its cut (1035)
 def test_whole_schedule_and_validation_identical(monkeypatch, rank, scheduled):
     record = record_data_module()
     for module in (record, new_data):

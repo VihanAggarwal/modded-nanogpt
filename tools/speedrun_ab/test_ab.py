@@ -1,8 +1,11 @@
 """CPU tests for the A/B tooling: run `python -m pytest tools/speedrun_ab -q`."""
 import json
+import os
 import random
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -133,3 +136,133 @@ def test_adjusted_wall_prices_val_at_the_record_rate():
     run = lambda wall_s, val: ab_stats.Run("x", 100, int(wall_s * 1000), val, {})
     # 2 millinats above the target cost 2 * 164 ms.
     assert abs(ab_stats.adjusted_wall([run(40.0, 3.2795)]) - 40.328) < 1e-9
+
+
+def test_leg_order_with_a_count_per_arm():
+    # The certification pool's shape: the candidate twice per round, master and #379 once, direction alternating.
+    order = ab_bench.leg_order(["m", "p", "c"], {"m": 6, "p": 6, "c": 12})
+    assert order[:8] == ["c", "m", "p", "c", "c", "p", "m", "c"]
+    assert {a: order.count(a) for a in "mpc"} == {"m": 6, "p": 6, "c": 12}
+    assert ab_bench.leg_order(["a", "b"], {"a": 3, "b": 3}) == ab_bench.leg_order(["a", "b"], 3)
+
+
+def bench(out, arm, *extra, legs=3):
+    cmd = [sys.executable, str(Path(ab_bench.__file__)), "--arm", f"a={arm}", "--arm", f"b={arm}", "--legs", str(legs),
+           "--out", str(out), "--command", "bash run.sh", *extra]
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def fake_arm(tmp_path, script="FAKE_STEP_MS=10 {py} fake.py\n"):
+    arm = tmp_path / "arm"
+    arm.mkdir(exist_ok=True)
+    (arm / "fake.py").write_text(FAKE_TRAINER)
+    (arm / "run.sh").write_text(script.format(py=sys.executable))
+    return arm
+
+
+def test_bench_resumes_without_rerunning_a_leg(tmp_path):
+    arm, out = fake_arm(tmp_path), tmp_path / "out"
+    assert bench(out, arm, legs=2).returncode == 0
+    first = (out / "ledger.jsonl").read_text()
+    # A leg that was running when the bench was killed: its stdout and a log that never reached the final validation.
+    lines = first.splitlines()
+    (out / "ledger.jsonl").write_text("\n".join(lines[:3]) + "\n")
+    partial = arm / "logs/0123abcd.txt"
+    partial.write_text("step:25/100 train_time:250ms step_avg:10ms\n")
+    (out / "a/leg003.stdout").write_text("logs/0123abcd.txt\n")
+    result = bench(out, arm, legs=2)
+    assert result.returncode == 0, result.stderr
+    ledger = [json.loads(line) for line in (out / "ledger.jsonl").read_text().splitlines()]
+    assert [r["leg"] for r in ledger] == [0, 1, 2, 3] and ledger[:3] == [json.loads(l) for l in lines[:3]]
+    (note,) = [json.loads(line) for line in (out / "interrupted.jsonl").read_text().splitlines()]
+    assert note["leg"] == 3 and Path(note["log"]).read_text() == partial.read_text()
+    # Nothing left to run; a different plan for the same --out is refused.
+    assert "4 of 4 legs" in bench(out, arm, legs=2).stdout
+    assert (out / "ledger.jsonl").read_text().count("\n") == 4
+    refused = bench(out, arm, legs=3)
+    assert refused.returncode != 0 and "different plan" in refused.stderr
+
+
+def test_bench_keeps_a_leg_that_finished_after_the_bench_died(tmp_path):
+    arm, out = fake_arm(tmp_path), tmp_path / "out"
+    assert bench(out, arm, legs=1).returncode == 0
+    ledger = [json.loads(line) for line in (out / "ledger.jsonl").read_text().splitlines()]
+    (out / "ledger.jsonl").write_text(json.dumps(ledger[0]) + "\n")  # leg 1 finished but never reached the ledger
+    assert bench(out, arm, legs=1).returncode == 0
+    resumed = [json.loads(line) for line in (out / "ledger.jsonl").read_text().splitlines()]
+    assert resumed[1]["recovered"] and resumed[1]["val_loss"] == ledger[1]["val_loss"]
+    assert not (out / "interrupted.jsonl").exists()
+
+
+def test_bench_stops_after_crashes_in_a_row_unless_the_arm_is_droppable(tmp_path):
+    arm = fake_arm(tmp_path, "FAKE_STEP_MS=10 FAKE_CRASH=$CRASH {py} fake.py\n")
+    cmd = lambda out, *extra: [sys.executable, str(Path(ab_bench.__file__)), "--arm", f"ok={arm}", "--arm", f"bad={arm}",
+                               "--arm-env", "bad:CRASH=1", "--legs", "4", "--out", str(out), "--command", "bash run.sh",
+                               "--max-crashes", "2", *extra]
+    stopped = subprocess.run(cmd(tmp_path / "stop"), capture_output=True, text=True)
+    assert stopped.returncode == 3 and "STOPPED: bad crashed 2 legs in a row" in stopped.stdout
+    ledger = [json.loads(line) for line in (tmp_path / "stop/ledger.jsonl").read_text().splitlines()]
+    assert [r["arm"] for r in ledger] == ["ok", "bad", "bad"]
+    dropped = subprocess.run(cmd(tmp_path / "drop", "--droppable", "bad"), capture_output=True, text=True)
+    assert dropped.returncode == 0 and "DROPPED bad" in dropped.stdout
+    ledger = [json.loads(line) for line in (tmp_path / "drop/ledger.jsonl").read_text().splitlines()]
+    assert [r["arm"] for r in ledger] == ["ok", "bad", "bad", "ok", "ok", "ok"]
+
+
+def test_bench_kills_a_hung_leg_and_its_process_group(tmp_path):
+    arm = fake_arm(tmp_path, "sleep 60 & echo $! > child.pid; FAKE_STEP_MS=10 {py} fake.py; sleep 60\n")
+    out = tmp_path / "out"
+    started = time.time()
+    result = bench(out, arm, "--leg-timeout", "1", legs=1)
+    assert result.returncode == 0 and time.time() - started < 30, result.stderr
+    ledger = [json.loads(line) for line in (out / "ledger.jsonl").read_text().splitlines()]
+    assert all(r["timed_out"] and r["exit_code"] != 0 for r in ledger)
+    child = int((arm / "child.pid").read_text())
+    time.sleep(0.2)
+    assert not Path(f"/proc/{child}").exists() or "Z" in Path(f"/proc/{child}/stat").read_text().split()[2]
+
+
+def alive(pid: int) -> bool:
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+def test_bench_resume_kills_a_leg_orphaned_by_a_killed_bench(tmp_path):
+    # SIGKILL (OOM killer, kill -9) skips the bench's cleanup, and the leg, in its own session, keeps running.
+    arm, out = fake_arm(tmp_path, "echo $$ > leg.pid; exec sleep 600\n"), tmp_path / "out"
+    cmd = [sys.executable, str(Path(ab_bench.__file__)), "--arm", f"a={arm}", "--arm", f"b={arm}", "--legs", "1",
+           "--out", str(out), "--command", "bash run.sh"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL)
+    deadline = time.time() + 30
+    while not (arm / "leg.pid").exists() or not (arm / "leg.pid").read_text().strip():
+        assert time.time() < deadline
+        time.sleep(0.05)
+    proc.kill()
+    proc.wait()
+    orphan = int((arm / "leg.pid").read_text())
+    assert alive(orphan)
+    (arm / "run.sh").write_text(f"FAKE_STEP_MS=10 {sys.executable} fake.py\n")
+    result = bench(out, arm, legs=1)
+    assert result.returncode == 0 and f"left over from a leg of an earlier run of this bench: [{orphan}]" in result.stdout
+    time.sleep(0.2)
+    assert not alive(orphan)
+    ledger = [json.loads(line) for line in (out / "ledger.jsonl").read_text().splitlines()]
+    assert [r["leg"] for r in ledger] == [0, 1] and all(r["val_loss"] is not None for r in ledger)
+
+
+def test_bench_under_nohup_survives_a_hangup(tmp_path):
+    arm, out = fake_arm(tmp_path, "touch started; sleep 1; FAKE_STEP_MS=10 {py} fake.py\n"), tmp_path / "out"
+    cmd = [sys.executable, str(Path(ab_bench.__file__)), "--arm", f"a={arm}", "--arm", f"b={arm}", "--legs", "1",
+           "--out", str(out), "--command", "bash run.sh"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, start_new_session=True,
+                            preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_IGN))
+    deadline = time.time() + 30
+    while not (arm / "started").exists():
+        assert time.time() < deadline
+        time.sleep(0.05)
+    os.killpg(proc.pid, signal.SIGHUP)  # what an interactive bash sends its jobs when the SSH session drops
+    assert proc.wait(timeout=60) == 0
+    ledger = [json.loads(line) for line in (out / "ledger.jsonl").read_text().splitlines()]
+    assert len(ledger) == 2 and all(r["val_loss"] is not None for r in ledger)
