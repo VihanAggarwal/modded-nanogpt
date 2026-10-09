@@ -1,0 +1,196 @@
+diff --git a/track_1_short/data.py b/track_1_short/data.py
+index 8a77d94..b2423b1 100644
+--- a/track_1_short/data.py
++++ b/track_1_short/data.py
+@@ -200,9 +200,11 @@ def split_attention_segments(cum_lengths: Tensor, cap: int) -> Tensor:
+     return torch.tensor(ends, dtype=cum_lengths.dtype)
+ 
+ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_len: int, staging: PinnedBatchStaging,
+-                               align_to_bos: bool = True):
++                               align_to_bos: bool = True, on_spans=None):
+     # align_to_bos: each sequence begins with Beginning of Sequence token, sequences truncated to max_seq_len
+     # staging: the pinned slots every batch's H2D copies go through (perf/pinned_batches.py)
++    # on_spans(file_idx, starts, ends): called with every batch's document spans for all ranks (index of the shard
++    # in the sorted file list; token ranges per rank), after each successful next_batch (stream_memory.py's tap)
+     rank = dist.get_rank()
+     world_size = dist.get_world_size()
+     assert num_tokens % world_size == 0, "Batch size must be divisible by world size"
+@@ -212,6 +214,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
+         raise FileNotFoundError(f"No files found for pattern: {filename_pattern}")
+ 
+     file_iter = iter(files)  # Use itertools.cycle(files) for multi-epoch training
++    file_idx = 0  # files[file_idx] is the current shard
+     if align_to_bos:
+         # The first batches only read the partial index's span: read that now, the rest in the index thread.
+         tokens, read_rest = _load_data_shard(next(file_iter), head_tokens=PARTIAL_INDEX_TOKENS)
+@@ -233,11 +236,14 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
+                 # This shard is exhausted, load the next one in the next loop iteration.
+                 shard = next_shard_getter()
+                 tokens = shard.tokens
++                file_idx += 1
+                 try:
+                     next_shard_getter = Shard.load_async(next(file_iter), world_size)
+                 except StopIteration:
+                     next_shard_getter = None  # no more shards to preload
+                 continue
++            if on_spans is not None:
++                on_spans(file_idx, seq_starts, seq_ends)
+ 
+             buf = torch.cat([tokens[i:j] for i, j in zip(start_idxs, end_idxs)])
+             _inputs = buf[:-1]
+diff --git a/track_1_short/run_log.py b/track_1_short/run_log.py
+index 0750a5e..062b79e 100644
+--- a/track_1_short/run_log.py
++++ b/track_1_short/run_log.py
+@@ -13,11 +13,11 @@ LOG_BUFFER_BYTES = 1 << 20
+ 
+ 
+ def read_source(entry_script: str) -> str:
+-    """Concatenate the entry script and every module of this package, for the run log.
++    """Concatenate the entry script and every module of this package (and its C source), for the run log.
+ 
+     Called first thing at startup so the log holds the code as it was at launch.
+     """
+-    files = [Path(entry_script)] + sorted(PACKAGE_DIR.rglob("*.py"))
++    files = [Path(entry_script)] + sorted([*PACKAGE_DIR.rglob("*.py"), *PACKAGE_DIR.rglob("*.c")])
+     root = Path(entry_script).resolve().parent
+     chunks = []
+     for path in files:
+diff --git a/train_gpt.py b/train_gpt.py
+index 39705f9..6f985b6 100644
+--- a/train_gpt.py
++++ b/train_gpt.py
+@@ -66,6 +66,7 @@ from track_1_short.perf.row_prefetch import PrefetchStaging, RowPrefetch
+ from track_1_short.perf.value_embed_pull import ValueEmbedPull
+ from track_1_short.sampled_softmax import SampledSoftmax
+ from track_1_short.schedule import TrainingSchedule
++from track_1_short import stream_memory
+ from track_1_short.tail_average import TailAverages
+ from track_1_short.training import TrainingManager
+ 
+@@ -189,9 +190,10 @@ def main():
+     batch_tokens = [s.batch_size // env.world_size for s in TRAINING_STAGES] + [val_tokens_per_rank]
+     batch_staging = PinnedBatchStaging(max(batch_tokens), max(map(cu_seqlens_rows, batch_tokens)), env.device)
+ 
+-    def train_loader():
++    def train_loader(on_spans=None):
+         return distributed_data_generator(
+             args.train_files, TRAINING_STAGES[0].batch_size, TRAINING_STAGES[0].train_max_seq_len, batch_staging,
++            on_spans=on_spans,
+         )
+ 
+     def val_loader():
+@@ -353,7 +355,19 @@ def main():
+     ########################################
+     #        Training and validation       #
+     ########################################
+-    batches = ScheduledBatches(train_loader(), training_schedule, steps=range(training_schedule.total_steps))
++    # STREAM_RETRIEVAL=1 (track_1_short/stream_memory.py): a memory of exactly the tokens this run trains on, mixed
++    # into the final validation. Here only the helper's compile, allocation and spawn; rank 0's timed loader feeds it
++    # every fetched step's spans on the clock (the warmup loader above never did), and it queries val before the
++    # clock stops.
++    memory = None
++    if stream_memory.ENABLED:
++        memory = stream_memory.StreamMemory.for_run(
++            train_pattern=args.train_files, val_pattern=args.val_files, world=env.world_size, rank=env.rank,
++            step_batch_sizes=[training_schedule.lookup(s)[0].batch_size for s in range(training_schedule.total_steps)],
++            master=env.master_process, val_tokens=args.val_tokens, chunk=val_tokens_per_rank, device=env.device,
++            print0=print0)
++    batches = ScheduledBatches(train_loader(on_spans=memory.on_spans if memory is not None and env.master_process else None),
++                               training_schedule, steps=range(training_schedule.total_steps))
+     row_prefetch = RowPrefetch(ngram_table, value_embed_pull, batches, range(training_schedule.total_steps),
+                                is_update_step, prefetch_staging)
+ 
+@@ -405,13 +419,15 @@ def main():
+         training_manager.advance_schedule(step)
+         # --------------- VALIDATION SECTION -----------------
+         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+-            if last_step:
++            if last_step and not (memory is not None and memory.fit_path):  # STREAM_RETRIEVAL_FIT reads on
+                 # Training is over: release its loader, so the two shards it holds go back to PyTorch's
+                 # pinned-memory cache, where the val shard's read finds a buffer instead of paying a
+                 # fresh 256 MB cudaHostAlloc on the clock.
+                 batches.close()
+             # The val reads start now, on the loader thread; collected below, before the n-gram pulls.
+             val_batches = loader_thread.submit(read_val_batches)
++            if last_step and memory is not None and env.master_process:
++                memory.go()  # every step is in the memory: the helper reads val and computes the rows, on the clock
+             # The deferred gathers land first: validation reads the banks and, at the last step, ships
+             # into them.
+             if last_step:
+@@ -439,18 +455,27 @@ def main():
+             val_pulls = ngram_table.eval_pulls([batch.ngram_ids for batch in val_batches])
+             for pull in val_pulls:
+                 ngram_table.land(pull)
++            # On the clock: wait for the helper's rows and copy this rank's to the device (raises if it failed).
++            stream_rows = memory.collect() if last_step and memory is not None else None
+             # stop the clock
+             torch.cuda.synchronize()
+             training_time_ms += 1000 * (time.perf_counter() - t0)
+             model.eval()
+             val_loss = 0
++            if stream_rows is not None:
++                memory.check(val_batches)  # the rows are this rank's val chunks
++                val_loss_lm = 0  # the same weights without the mixture: the gain, paired
+             if getattr(model, "cplm", False):
+                 model.cplm_diag.zero_()
+             with torch.no_grad():
+-                for batch, pull in zip(val_batches, val_pulls):
++                for s, (batch, pull) in enumerate(zip(val_batches, val_pulls)):
+                     ngram_table.land(pull)
+-                    val_loss += model(batch.inputs, batch.targets, batch.cum_seqlens, ngram_table.slots(pull, batch.ngram_ids),
+-                                      training_manager.get_forward_args()).mean()
++                    nll = model(batch.inputs, batch.targets, batch.cum_seqlens, ngram_table.slots(pull, batch.ngram_ids),
++                                training_manager.get_forward_args())
++                    if stream_rows is not None:
++                        val_loss_lm += nll.mean()
++                        nll = stream_memory.mix(nll, stream_rows[s])
++                    val_loss += nll.mean()
+             val_loss /= val_steps
+             if last_step and getattr(model, "cplm", False) and os.environ.get("CPLM_EVAL_BLOCKS"):
+                 # Diagnostic: re-evaluate the same final model with wider copy bands (validation only; the
+@@ -460,10 +485,11 @@ def main():
+                     uncompiled_model.copy_eval_block = blk
+                     vl = 0
+                     with torch.no_grad():
+-                        for batch, pull in zip(val_batches, val_pulls):
++                        for s, (batch, pull) in enumerate(zip(val_batches, val_pulls)):
+                             ngram_table.land(pull)
+-                            vl += model(batch.inputs, batch.targets, batch.cum_seqlens, ngram_table.slots(pull, batch.ngram_ids),
+-                                        training_manager.get_forward_args()).mean()
++                            nll = model(batch.inputs, batch.targets, batch.cum_seqlens, ngram_table.slots(pull, batch.ngram_ids),
++                                        training_manager.get_forward_args())
++                            vl += (nll if stream_rows is None else stream_memory.mix(nll, stream_rows[s])).mean()
+                     vl = vl / val_steps
+                     dist.reduce(vl, 0, op=dist.ReduceOp.AVG)
+                     print0(f"step:{step}/{training_schedule.total_steps} val_loss@copyL{blk}:{vl:.4f}", console=True)
+@@ -471,6 +497,12 @@ def main():
+             del val_batches, val_pulls
+             dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
+             print0(f"step:{step}/{training_schedule.total_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
++            if stream_rows is not None:
++                val_loss_lm /= val_steps
++                dist.reduce(val_loss_lm, 0, op=dist.ReduceOp.AVG)
++                print0(f"step:{step} stream_retrieval val_loss_lm:{val_loss_lm:.5f} val_loss_mixed:{val_loss:.5f} "
++                       f"gain:{1000 * (val_loss_lm - val_loss):.2f}mnat", console=True)
++                print0(memory.stats(), console=True)
+             if getattr(model, "cplm", False):  # CPLM diagnostics (token-averaged over all ranks)
+                 d = model.cplm_diag.clone(); dist.all_reduce(d)
+                 n = d[0].clamp_min(1)
+@@ -484,6 +516,16 @@ def main():
+             t0 = time.perf_counter()
+ 
+         if last_step:
++            if memory is not None and memory.fit_path:  # STREAM_RETRIEVAL_FIT: dev only, untimed
++                model.eval()
++                with torch.no_grad():
++                    stream_memory.fit_dump(memory, batches.loader, lambda b: model(
++                        b.inputs, b.targets, b.cum_seqlens, ngram_table.load_eval_batch(b.ngram_ids),
++                        training_manager.get_forward_args()), val_tokens_per_rank, batch_staging, env.rank, print0)
++                model.train()
++                batches.close()
++            if memory is not None:
++                memory.close()
+             # The checkpoint has no n-gram table: it is sharded across ranks and this saves rank 0 only.
+             if env.master_process and args.save_checkpoint:
+                 log = dict(step=step, code=code, model=model.state_dict(), optimizer=training_manager.get_state())

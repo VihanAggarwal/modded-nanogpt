@@ -2,7 +2,8 @@
 this; see the README next to it.
 
   A smoke     one leg of the stack (and of the ML-only arm if the stack fails): which candidate runs at all.
-  B pilot     interleaved: master, #379, the candidate at 978 and 963 scheduled steps (+ mlonly at 978).
+  B pilot     interleaved: master, #379, the candidate at 978 and 963 scheduled steps (+ mlonly at 978), and, only
+              when the attempt is given --streamret-cuts, the stack with stream retrieval (streamret) at those cuts.
   C decision  the pre-registered rule below picks the candidate and its step count from the pilot.
   D certify   a fresh interleaved pool: the candidate, master and #379. Only this pool enters the p-value.
 
@@ -31,11 +32,32 @@ FAMILIES = ("stack", "mlonly")       # candidates in order of preference
 STEP_OPTIONS = (978, 963)            # scheduled steps; +72 growth and extension steps are trained on top
 GROWTH_STEPS = 72
 GATE_963 = 3.2765                    # >= 3.5 millinats under 3.28
+# The stack plus stream-only retrieval (tools/stream_retrieval/make_streamret_arm.sh builds that arm), run with
+# STREAM_RETRIEVAL=1. Its gain only pays as a step cut, so it has no default cuts: they come from a measured gain
+# (one STREAM_RETRIEVAL=1 dev run's `gain:` line, tools/stream_retrieval/README.md) and are passed as --streamret-cuts.
+RETRIEVAL = "streamret"
 MIN_PER_LEG, MIN_PER_COMPILE, MIN_SETUP = (2, 3), 7, 15   # per warm leg: a range, never measured for this trainer
 STOPPED = 3                          # ab_bench's exit code after --max-crashes
 
 
-def rule_text(legs_pilot: int, legs_cert: int, legs_cert_base: int) -> str:
+def parse_cuts(text: str | None) -> tuple[int, ...]:
+    """--streamret-cuts '940,900' -> (900, 940): scheduled step counts below the stack's 978, ascending."""
+    cuts = tuple(sorted({int(c) for c in (text or "").replace(" ", "").split(",") if c}))
+    if any(not 0 < c < STEP_OPTIONS[0] for c in cuts):
+        raise SystemExit(f"--streamret-cuts {text}: each cut is a scheduled step count below {STEP_OPTIONS[0]}")
+    return cuts
+
+
+def rule_text(legs_pilot: int, legs_cert: int, legs_cert_base: int, cuts: tuple[int, ...] = ()) -> str:
+    retrieval = bool(cuts)
+    step4 = f"""\
+4. Stream retrieval: streamret (the stack plus stream retrieval, STREAM_RETRIEVAL=1) runs {legs_pilot} pilot legs at
+   each of {" and ".join(map(str, cuts))} scheduled steps (cuts set from a dev run's measured gain). Its step count is
+   the lowest of these whose {legs_pilot} legs all finished with a mean final val <= {GATE_963}; if none, it is not
+   eligible. It replaces the candidate of rules 2-3 only if all its pilot legs finished and its pilot train time at
+   that step count is below the candidate's (at the step count of rule 3) by more than twice the Welch standard
+   error of the difference.
+""" if retrieval else ""
     return f"""\
 PRE-REGISTERED DECISION RULE (fixed before the first leg; applied by tools/record_attempt/attempt.py)
 1. Viable: a candidate (stack = this branch; mlonly = #379 + #375 without the systems patches) is viable
@@ -44,16 +66,16 @@ PRE-REGISTERED DECISION RULE (fixed before the first leg; applied by tools/recor
    more than twice the Welch standard error of the difference; then mlonly, if viable. Neither: stop.
 3. Step count: 963 scheduled steps (1035 trained) only if all {legs_pilot} pilot legs of the candidate at 963
    finished with a mean final val <= {GATE_963} (>= 3.5 millinats under 3.28); otherwise 978 (1050 trained).
-4. Certification: a fresh interleaved pool of the candidate (n={legs_cert}) with master (n={legs_cert_base}) and
+{step4}{5 if retrieval else 4}. Certification: a fresh interleaved pool of the candidate (n={legs_cert}) with master (n={legs_cert_base}) and
    #379 (n={legs_cert_base}). Every leg is kept and counted, and only this pool enters the p-value; smoke and
    pilot legs are reported, never pooled.
 """
 
 
 def family_of(arm: str) -> str:
-    """stack963 -> stack; master and pr379 are their own."""
+    """stack963 -> stack, streamret900 -> streamret; master and pr379 are their own."""
     stem = arm.rstrip("0123456789")
-    return stem if stem in FAMILIES else arm
+    return stem if stem in FAMILIES + (RETRIEVAL,) else arm
 
 
 def finished(record: dict) -> bool:
@@ -61,19 +83,22 @@ def finished(record: dict) -> bool:
 
 
 def source_digest(arm_dir: Path) -> str:
-    """sha256 of what a run log embeds: train_gpt.py and every module of track_1_short/ (run_log.read_source)."""
+    """sha256 of what a run log embeds: train_gpt.py and every module (and C source) of track_1_short/
+    (run_log.read_source)."""
     h = hashlib.sha256()
-    for path in [arm_dir / "train_gpt.py"] + sorted((arm_dir / "track_1_short").rglob("*.py")):
+    package = arm_dir / "track_1_short"
+    for path in [arm_dir / "train_gpt.py"] + sorted([*package.rglob("*.py"), *package.rglob("*.c")]):
         if path.exists():
             h.update(str(path.relative_to(arm_dir)).encode() + b"\0" + path.read_bytes())
     return h.hexdigest()
 
 
-def pilot_arms(families: list[str]) -> list[str]:
-    """The pilot's arms for the viable families in `families` (the first is the primary candidate)."""
+def pilot_arms(families: list[str], cuts: tuple[int, ...] = ()) -> list[str]:
+    """The pilot's arms for the viable families in `families` (the first is the primary candidate), and the stream
+    retrieval arms at `cuts` when the attempt has them."""
     primary = families[0]
     arms = ["master", "pr379"] + [f"{primary}{steps}" for steps in STEP_OPTIONS]
-    return arms + [f"{f}978" for f in families[1:]]
+    return arms + [f"{f}978" for f in families[1:]] + [f"{RETRIEVAL}{c}" for c in cuts]
 
 
 def cert_legs(candidate_arm: str, legs_cert: int, legs_cert_base: int) -> dict[str, int]:
@@ -128,7 +153,30 @@ def decide(pilot_order: list[str], ledger: list[dict], smoke_ok: dict[str, bool]
                        f"{'<=' if steps == 963 else '>'} {GATE_963}: {steps} scheduled steps")
     else:
         reasons.append(f"{candidate} has no pilot legs at 963 steps: 978 scheduled steps")
-    return dict(candidate=candidate, steps=steps, arm=f"{candidate}{steps}", reasons=reasons)
+    base = f"{candidate}{steps}"
+    retrieval_arms = [arm for arm in planned if family_of(arm) == RETRIEVAL]
+    if retrieval_arms:
+        cut = None
+        if viable(RETRIEVAL):
+            for arm in sorted(retrieval_arms, key=lambda a: int(a[len(RETRIEVAL):])):
+                mean = sum(vals[arm]) / len(vals[arm])
+                reasons.append(f"{arm}: mean pilot val {mean:.5f} over {len(vals[arm])} legs "
+                               f"{'<=' if mean <= GATE_963 else '>'} {GATE_963}")
+                if mean <= GATE_963:
+                    cut = arm
+                    break
+        if cut is None:
+            reasons.append(f"{RETRIEVAL}: not eligible (no step cut passed): {base} stays")
+        elif min(len(walls[cut]), len(walls[base])) < 2:
+            reasons.append(f"{RETRIEVAL}: fewer than 2 finished legs to compare with {base}: {base} stays")
+        else:
+            diff, _, _, se = ab_stats.welch(walls[cut], walls[base])
+            better = diff < -2 * se
+            reasons.append(f"{cut} - {base} train time {diff:+.3f} s, 2 se = {2 * se:.3f} s: "
+                           + (f"faster beyond noise, so {cut}" if better else f"not faster beyond noise, so {base} stays"))
+            if better:
+                return dict(candidate=RETRIEVAL, steps=int(cut[len(RETRIEVAL):]), arm=cut, reasons=reasons, base=base)
+    return dict(candidate=candidate, steps=steps, arm=base, reasons=reasons)
 
 
 class Attempt:
@@ -141,19 +189,25 @@ class Attempt:
             self.arms[name], self.given[name] = Path(path).resolve(), path
         missing = {"master", "pr379", "stack"} - set(self.arms)
         assert not missing, f"missing --arm for {sorted(missing)}"
+        self.cuts = parse_cuts(args.streamret_cuts)
+        self.retrieval = RETRIEVAL in self.arms
+        if self.retrieval != bool(self.cuts):
+            raise SystemExit("the streamret arm and --streamret-cuts go together (STREAMRET_CUTS in run.sh)")
         self.settings = dict(legs_pilot=args.legs_pilot, legs_cert=args.legs_cert, legs_cert_base=args.legs_cert_base,
                              cold=args.cold, command=args.command, max_crashes=args.max_crashes, data=args.data)
-        self.rule = rule_text(args.legs_pilot, args.legs_cert, args.legs_cert_base)
+        if self.cuts:
+            self.settings["streamret_cuts"] = list(self.cuts)
+        self.rule = rule_text(args.legs_pilot, args.legs_cert, args.legs_cert_base, self.cuts)
 
     # ------------------------------------------------------------------ plan
 
     def plan(self) -> str:
         s = self.settings
         families = [f for f in FAMILIES if f in self.arms]
-        pilot = ab_bench.leg_order(pilot_arms(families), s["legs_pilot"])
+        pilot = ab_bench.leg_order(pilot_arms(families, self.cuts), s["legs_pilot"])
         cert = ab_bench.leg_order(["master", "pr379", "CAND"], cert_legs("CAND", s["legs_cert"], s["legs_cert_base"]))
         legs = 1 + len(pilot) + len(cert)
-        compiles = 2 + len(families)
+        compiles = 2 + len(families) + self.retrieval
         minutes = [legs * per_leg + compiles * MIN_PER_COMPILE + MIN_SETUP + legs * MIN_PER_COMPILE * s["cold"]
                    for per_leg in MIN_PER_LEG]
         lines = [
@@ -171,6 +225,9 @@ class Attempt:
         ]
         if "mlonly" not in self.arms:
             lines.append("  (no mlonly arm: the fallback candidate is unavailable)")
+        if self.retrieval:
+            lines.append(f"  streamret = the stack plus stream retrieval (make_streamret_arm.sh), STREAM_RETRIEVAL=1, pilot "
+                         f"at {' and '.join(map(str, self.cuts))} scheduled steps (rule 4)")
         return "\n".join(lines) + "\n\n" + self.rule
 
     # ------------------------------------------------------------------ state
@@ -220,8 +277,10 @@ class Attempt:
                "--max-crashes", str(s["max_crashes"]), "--leg-timeout", str(self.args.leg_timeout)]
         for name, family in arms.items():
             cmd += ["--arm", f"{name}={self.arms[family]}", "--arm-legs", f"{name}={legs[name]}"]
-            if family in FAMILIES:  # explicit step count, whatever the arm's default
+            if family in FAMILIES + (RETRIEVAL,):  # explicit step count, whatever the arm's default
                 cmd += ["--arm-env", f"{name}:NUM_SCHEDULED_ITERATIONS={name[len(family):] or STEP_OPTIONS[0]}"]
+            if family == RETRIEVAL:
+                cmd += ["--arm-env", f"{name}:STREAM_RETRIEVAL=1"]
         cmd += [arg for name in droppable for arg in ("--droppable", name)]
         if s["data"]:
             cmd += ["--data-path", s["data"]]
@@ -284,11 +343,12 @@ class Attempt:
                       "Triton, NCCL, the driver), start a new attempt in a new RUNS directory inside WORK, e.g. "
                       f"RUNS={self.next_runs()} bash tools/record_attempt/run.sh; its record README discloses "
                       "this one.")
-        arms = pilot_arms(families)
+        # streamret is the stack plus the retrieval overlay: it runs only if the stack's smoke leg finished.
+        arms = pilot_arms(families, self.cuts if smoke_ok.get("stack", True) else ())
         legs = dict.fromkeys(arms, self.settings["legs_pilot"])
         # Master and #379 crashing in a row means the node is broken: stop. A candidate's arm only loses its legs.
         ledger = self.bench("pilot", {arm: family_of(arm) for arm in arms}, legs,
-                            droppable=[a for a in arms if family_of(a) in FAMILIES])
+                            droppable=[a for a in arms if family_of(a) in FAMILIES + (RETRIEVAL,)])
         path = self.runs / "decision.json"
         decided = decide(ab_bench.leg_order(arms, legs), ledger, smoke_ok)
         decided["smoke"] = smoke_ok
@@ -338,7 +398,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--runs", required=True, help="the attempt's directory: ledgers, logs, decision, verdict")
     parser.add_argument("--arm", action="append", required=True, metavar="NAME=DIR",
-                        help="master, pr379, stack and (optionally) mlonly checkouts")
+                        help="master, pr379, stack and (optionally) mlonly checkouts, and streamret (with --streamret-cuts)")
+    parser.add_argument("--streamret-cuts", default=None, metavar="S1,S2",
+                        help="the streamret arm's scheduled step counts (from a dev run's measured gain)")
     parser.add_argument("--data", default=None, help="DATA_PATH of every leg")
     parser.add_argument("--legs-pilot", type=int, default=3)
     parser.add_argument("--legs-cert", type=int, default=12, help="certification legs of the candidate")

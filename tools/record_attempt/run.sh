@@ -7,8 +7,9 @@
 # from; default python3.12, python3 or python3.11, else a uv-built 3.12), PYTHON (use this python, no venv),
 # RUNS (default WORK/runs; a new directory directly in WORK is a new attempt that reuses the venv, data and arms),
 # LEGS_PILOT=3, LEGS_CERT=12, LEGS_CERT_BASE=6, COLD=1, MAX_CRASHES=2, LEG_TIMEOUT=1800 (s), RECORD_NAME,
-# ALLOW_NEW_MASTER=1, ALLOW_PR_DRIFT=1 (make_mlonly_arm.sh). For tests: SETUP=0 skips the node setup; LEG_COMMAND,
-# STACK_DIR, MASTER_DIR, PR379_DIR, MAKE_MLONLY, RECORDS_DIR.
+# ALLOW_NEW_MASTER=1, ALLOW_PR_DRIFT=1 (make_mlonly_arm.sh), STREAMRET_CUTS=S1[,S2] (adds the stream-retrieval arm at
+# these scheduled steps; unset: no such arm). Tests: SETUP=0 skips the node setup; LEG_COMMAND, STACK_DIR, MASTER_DIR,
+# PR379_DIR, MAKE_MLONLY, MAKE_STREAMRET, RECORDS_DIR.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/../.." && pwd)
 TOOLS=$HERE/tools/record_attempt
@@ -16,7 +17,7 @@ DRY_RUN=0
 for arg in "$@"; do
     case $arg in
         --dry-run) DRY_RUN=1 ;;
-        -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
         *) echo "unknown argument: $arg (see --help)" >&2; exit 2 ;;
     esac
 done
@@ -30,6 +31,8 @@ RUNS=$(realpath -m "${RUNS:-$WORK/runs}")
 SETUP=${SETUP:-1}
 STACK_DIR=${STACK_DIR:-$HERE}
 MAKE_MLONLY=${MAKE_MLONLY:-$TOOLS/make_mlonly_arm.sh}
+MAKE_STREAMRET=${MAKE_STREAMRET:-$HERE/tools/stream_retrieval/make_streamret_arm.sh}
+STREAMRET_CUTS=${STREAMRET_CUTS:-}
 PY=${PYTHON:-python3}
 
 say() { printf '%s\n' "$@"; }  # one line per argument
@@ -75,7 +78,7 @@ if [ "$DRY_RUN" = 0 ]; then
 fi
 
 # Every leg runs each arm's own defaults: no trainer knob, seed or compile setting may leak in from this shell (rule 3).
-leaked=$(compgen -e | grep -E '^(CPLM|FA3_|TORCHINDUCTOR_|TORCHDYNAMO_|TORCH_COMPILE|INDUCTOR_)' \
+leaked=$(compgen -e | grep -E '^(CPLM|FA3_|STREAM_RETRIEVAL|TORCHINDUCTOR_|TORCHDYNAMO_|TORCH_COMPILE|INDUCTOR_)' \
     | grep -vE '_CACHE_DIR$' || true)
 for v in ALLOW_4_GPUS ALL_SHORT COPY_TRUE_DOCS DATA_PATH LR_COOLDOWN_FRAC NGRAM_CACHE_MIN_ROWS NO_MTP NO_PREFIX \
          NUM_SCHEDULED_ITERATIONS PROFILE_STEPS PROFILE_TOP TRAIN_SEED VAL_EVERY WS_SCALE KX_STEPS KX_SEED; do
@@ -92,6 +95,11 @@ if [ -n "${RECORD_NAME:-}" ]; then ATTEMPT+=(--record-name "$RECORD_NAME"); fi
 say "===== record attempt: $STACK_DIR ($(git -C "$STACK_DIR" rev-parse --short HEAD 2>/dev/null || echo 'not git'))"
 PLANNED=(--arm master="${MASTER_DIR:-$WORK/arms/master}" --arm pr379="${PR379_DIR:-$WORK/arms/pr379}" --arm stack="$STACK_DIR")
 if ! grep -qs '^none:' "$RUNS/mlonly_arm.txt"; then PLANNED+=(--arm mlonly="(built by make_mlonly_arm.sh)"); fi
+# The stream-retrieval arm (attempt.py's rule 4), only with STREAMRET_CUTS: the stack plus tools/stream_retrieval's
+# overlay in its own worktree, so the stack's checkout (and a stack record's source) never carries the retrieval code.
+if [ -n "$STREAMRET_CUTS" ]; then
+    PLANNED+=(--arm streamret="(built by make_streamret_arm.sh)" --streamret-cuts "$STREAMRET_CUTS")
+fi
 "$PY" "$TOOLS/attempt.py" --dry-run "${ATTEMPT[@]}" "${PLANNED[@]}"
 
 # Free space per filesystem, summed over what lands on it: path, GB, what.
@@ -221,11 +229,12 @@ if [ "$SETUP" = 1 ]; then
 
     say "" "===== preflight: packages, GPUs, headers, Triton, NCCL, FA3 kernel, tokenizer, mask builder"
     if [ "$DRY_RUN" = 0 ]; then
-        "$PY" "$TOOLS/preflight.py" --stack "$STACK_DIR" --runs "$RUNS" || die "preflight failed (above)"
+        "$PY" "$TOOLS/preflight.py" --stack "$STACK_DIR" --runs "$RUNS" ${STREAMRET_CUTS:+--stream-helper} \
+            || die "preflight failed (above)"
         source "$RUNS/preflight.env"
         ATTEMPT+=(--environment "$RUNS/environment.txt")
     else
-        say "  would run: $PY $TOOLS/preflight.py --stack $STACK_DIR --runs $RUNS"
+        say "  would run: $PY $TOOLS/preflight.py --stack $STACK_DIR --runs $RUNS${STREAMRET_CUTS:+ --stream-helper}"
     fi
 fi
 
@@ -273,6 +282,16 @@ else
     MLONLY_DIR=$(cat "$RUNS/mlonly_arm.txt")
 fi
 ARMS=(--arm master="$MASTER_DIR" --arm pr379="$PR379_DIR" --arm stack="$STACK_DIR")
+if [ -n "$STREAMRET_CUTS" ]; then  # asked for: a failed build stops here, before any leg
+    if [ "$DRY_RUN" = 1 ]; then
+        say "  would build the streamret arm: bash $MAKE_STREAMRET $WORK"
+    else
+        STREAMRET_DIR=$(bash "$MAKE_STREAMRET" "$WORK" 2> >(sed 's/^/  /' >&2) | tail -n 1) \
+            || die "make_streamret_arm.sh failed (above); unset STREAMRET_CUTS to attempt without the streamret arm"
+        [ -f "$STREAMRET_DIR/train_gpt.py" ] || die "make_streamret_arm.sh printed '$STREAMRET_DIR', which holds no train_gpt.py"
+        ARMS+=(--arm streamret="$STREAMRET_DIR" --streamret-cuts "$STREAMRET_CUTS")
+    fi
+fi
 if [ -n "$MLONLY_DIR" ] && [ "${MLONLY_DIR#none: }" = "$MLONLY_DIR" ]; then
     ARMS+=(--arm mlonly="$MLONLY_DIR")
 elif [ -n "$MLONLY_DIR" ]; then

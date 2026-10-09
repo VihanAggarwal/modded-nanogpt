@@ -2,7 +2,9 @@
 
 The end-to-end tests run run.sh itself (SETUP=0 skips the node setup) with a fake trainer in place of torchrun: it
 writes a run log in the real format, with a train time and final val set per arm in the arm's fake.json, and the
-step count taken from NUM_SCHEDULED_ITERATIONS as the real trainer does.
+step count taken from NUM_SCHEDULED_ITERATIONS as the real trainer does. With STREAM_RETRIEVAL=1 (the streamret arm,
+its own directory as make_streamret_arm.sh builds it, with the stack's numbers) its val drops by the arm's sr_gain and
+it logs the trainer's stream_retrieval line.
 """
 import collections
 import datetime
@@ -61,7 +63,10 @@ with open(path, "w") as f:
         sys.exit("Traceback (most recent call last): fake crash")
     wall = steps * cfg["ms_per_step"] + rng.gauss(0, 30)
     val = cfg["val978"] + cfg.get("val_per_step", 0) * (978 - sched) + rng.gauss(0, cfg.get("val_sd", 0.0008))
-    f.write(f"step:{steps}/{steps} val_loss:{val:.4f} train_time:{wall:.0f}ms step_avg:{wall / steps:.2f}ms\n")
+    gain = cfg.get("sr_gain", 0.0) if os.environ.get("STREAM_RETRIEVAL") == "1" else None
+    f.write(f"step:{steps}/{steps} val_loss:{val - (gain or 0):.4f} train_time:{wall:.0f}ms step_avg:{wall / steps:.2f}ms\n")
+    if gain is not None:
+        f.write(f"step:{steps} stream_retrieval val_loss_lm:{val:.5f} val_loss_mixed:{val - gain:.5f} gain:{1000 * gain:.2f}mnat\n")
 '''
 
 # Per arm: the default scheduled steps (master 1122 -> 1194 trained), ms per step, val at 978 scheduled steps and
@@ -88,14 +93,23 @@ def make_node(tmp_path: Path, **overrides) -> dict:
             f'# fake {name}\nfor _k, _v in (("NUM_SCHEDULED_ITERATIONS", "{default}"),):\n    pass\n')
         (dirs[name] / "track_1_short/__init__.py").write_text("")
         (dirs[name] / "fake.json").write_text(json.dumps(cfg))
+    streamret = tmp_path / "arms" / "streamret"  # the stack plus the overlay: the stack's numbers
+    shutil.copytree(dirs["stack"], streamret)
+    (streamret / "track_1_short/stream_memory.py").write_text("# fake overlay\n")
+    (streamret / "fake.json").write_text(json.dumps(dict(json.loads((dirs["stack"] / "fake.json").read_text()),
+                                                         name="streamret")))
+    dirs["streamret"] = streamret
     builder = tmp_path / "make_mlonly.sh"
     builder.write_text(overrides.get("builder", f'echo "building" >&2\necho "{dirs["mlonly"]}"\n'))
+    streamret_builder = tmp_path / "make_streamret.sh"
+    streamret_builder.write_text(f'echo "make_streamret_arm: building" >&2\necho "{streamret}"\n')
     work = tmp_path / "work"
     env = dict(os.environ, SETUP="0", WORK=str(work), DATA=str(tmp_path / "data"), PYTHON=sys.executable,
                LEG_COMMAND=f"{sys.executable} {fake}", STACK_DIR=str(dirs["stack"]), MASTER_DIR=str(dirs["master"]),
-               PR379_DIR=str(dirs["pr379"]), MAKE_MLONLY=str(builder), RECORDS_DIR=str(tmp_path / "records"),
+               PR379_DIR=str(dirs["pr379"]), MAKE_MLONLY=str(builder), MAKE_STREAMRET=str(streamret_builder),
+               RECORDS_DIR=str(tmp_path / "records"),
                FAKE_COUNTER=str(tmp_path / "counter"))
-    for key in ("NUM_SCHEDULED_ITERATIONS", "TRAIN_SEED", "DATA_PATH"):
+    for key in ("NUM_SCHEDULED_ITERATIONS", "TRAIN_SEED", "DATA_PATH", "STREAMRET_CUTS"):
         env.pop(key, None)
     return dict(env=env, dirs=dirs, work=work, runs=work / "runs", records=tmp_path / "records",
                 counter=tmp_path / "counter")
@@ -152,6 +166,7 @@ def rec(arm, val=3.2760, wall=36.0):
 
 
 PILOT = ["master", "pr379", "stack978", "stack963", "mlonly978"]
+PILOT_SR = PILOT + ["streamret860", "streamret900"]  # with STREAMRET_CUTS=900,860 (ascending in the plan)
 
 
 def pilot_ledger(stack963_val=3.2760, stack_wall=35.5, mlonly_wall=36.0, crash=None):
@@ -180,6 +195,32 @@ def test_decision_rule(kwargs, smoke, expected):
     assert d["arm"] == f"{expected[0]}{expected[1]}"
 
 
+def sr_ledger(cut_vals: dict, base_wall=35.0, sr_wall=32.0, crash=None):
+    """The default pilot (stack963 passes) plus streamret legs: val per cut, train time sr_wall."""
+    out = pilot_ledger(stack_wall=base_wall + 0.5)
+    for i in range(3):
+        for cut, val in cut_vals.items():
+            arm = f"streamret{cut}"
+            out.append(rec(arm, None if (arm, i) == crash else val, sr_wall + 0.01 * i))
+    return out
+
+
+@pytest.mark.parametrize("kwargs, expected", [
+    (dict(cut_vals={900: 3.2700, 860: 3.2740}), ("streamret", 860)),             # the lowest passing cut
+    (dict(cut_vals={900: 3.2700, 860: 3.2790}), ("streamret", 900)),
+    (dict(cut_vals={900: 3.2766, 860: 3.2790}), ("stack", 963)),                 # no cut passes: not eligible
+    (dict(cut_vals={900: 3.2700, 860: 3.2740}, sr_wall=35.005), ("stack", 963)),  # within noise of stack963
+    (dict(cut_vals={900: 3.2700, 860: 3.2740}, crash=("streamret900", 2)), ("stack", 963)),  # not viable
+])
+def test_decision_rule_with_stream_retrieval(kwargs, expected):
+    arms = PILOT_SR
+    order = [a for i in range(3) for a in (arms if i % 2 == 0 else arms[::-1])]
+    d = attempt.decide(order, sr_ledger(**kwargs), {"stack": True})
+    assert (d["candidate"], d["steps"]) == expected, d["reasons"]
+    if expected[0] == "streamret":
+        assert d["base"] == "stack963" and d["arm"] == f"streamret{expected[1]}"
+
+
 def test_decision_rule_without_a_viable_candidate():
     pilot = ["master", "pr379", "mlonly978", "mlonly963"]
     ledger = [rec(a, None if a == "mlonly963" else 3.276) for a in pilot]
@@ -189,6 +230,11 @@ def test_decision_rule_without_a_viable_candidate():
 
 def test_readme_carries_the_rule_verbatim():
     assert attempt.rule_text(3, 12, 6) in (HERE / "README.md").read_text()
+    with_cuts = attempt.rule_text(3, 12, 6, attempt.parse_cuts("900,860"))
+    assert "4. Stream retrieval" in with_cuts and "each of 860 and 900 scheduled" in with_cuts
+    assert "Stream retrieval" not in attempt.rule_text(3, 12, 6)
+    with pytest.raises(SystemExit):
+        attempt.parse_cuts("978")
 
 
 # ---------------------------------------------------------------- run.sh end to end
@@ -199,7 +245,14 @@ def test_dry_run_prints_the_plan_and_touches_nothing(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "40 legs" in result.stdout and "PRE-REGISTERED DECISION RULE" in result.stdout
     assert "D certify: 24 legs" in result.stdout and "B pilot:   15 legs" in result.stdout
+    assert "streamret" not in result.stdout and "Stream retrieval" not in result.stdout  # only with STREAMRET_CUTS
     assert not node["work"].exists() and not node["counter"].exists()
+    node["env"]["STREAMRET_CUTS"] = "900,860"
+    with_cuts = run_sh(node, "--dry-run")
+    assert with_cuts.returncode == 0, with_cuts.stderr
+    assert "46 legs" in with_cuts.stdout and "B pilot:   21 legs" in with_cuts.stdout
+    assert "streamret900" in with_cuts.stdout and "4. Stream retrieval" in with_cuts.stdout
+    assert "would build the streamret arm" in with_cuts.stdout and not node["work"].exists()
 
 
 def test_end_to_end_stack_at_963(tmp_path):
@@ -221,6 +274,7 @@ def test_end_to_end_stack_at_963(tmp_path):
     counts = {sub: len(list((folder / sub).glob("*.txt"))) for sub in ("this_pr", "baseline", "baseline_pr379")}
     assert counts == {"this_pr": 12, "baseline": 6, "baseline_pr379": 6}
     assert {p.name: len(list(p.glob("*.txt"))) for p in (folder / "pilot").iterdir()} == dict.fromkeys(PILOT, 3)
+    assert "retrieval" not in (folder / "README.md").read_text().lower()
     assert len(list((folder / "smoke/stack").glob("*.txt"))) == 1
     assert all("step:1035/1035 val_loss" in p.read_text() for p in (folder / "this_pr").glob("*.txt"))
     assert all("step:1194/1194 val_loss" in p.read_text() for p in (folder / "baseline").glob("*.txt"))
@@ -405,6 +459,37 @@ def test_a_second_attempt_on_the_same_day_discloses_the_first_and_sends_both(tmp
     assert {"runs/verdict.txt", "runs_2/verdict.txt", f"{first.name}/README.md", f"{folder.name}/README.md"} <= names
 
 
+def test_end_to_end_stream_retrieval_wins_with_its_cut(tmp_path):
+    # Retrieval worth 30 millinats: both cuts pass the gate, 860 is the lowest, and it beats stack963 beyond noise.
+    node = make_node(tmp_path, stack=dict(sr_gain=0.030))
+    node["env"]["STREAMRET_CUTS"] = "900,860"
+    result = run_sh(node)
+    assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-3000:]
+    assert "make_streamret_arm: building" in result.stdout + result.stderr
+    assert collections.Counter(r["arm"] for r in ledger(node, "pilot")) == dict.fromkeys(PILOT_SR, 3)
+    arms = json.loads((node["runs"] / "attempt.json").read_text())["arms"]
+    assert arms["streamret"] == str(node["dirs"]["streamret"].resolve()) != arms["stack"]  # its own tree
+    decision = json.loads((node["runs"] / "decision.json").read_text())
+    assert (decision["candidate"], decision["steps"], decision["arm"], decision["base"]) == \
+        ("streamret", 860, "streamret860", "stack963")
+    cert = ledger(node, "cert")
+    assert collections.Counter(r["arm"] for r in cert) == {"streamret860": 12, "master": 6, "pr379": 6}
+    folder = record_folder(node)
+    assert folder.name.endswith("_CPLMNormHashesSystemsStreamRetrieval")
+    assert all("step:932/932 val_loss" in p.read_text() for p in (folder / "this_pr").glob("*.txt"))
+    readme = (folder / "README.md").read_text()
+    for text in ("Stream-only retrieval at the final validation", "Herman Brunborg", "StreamIndex", "#380 (Deven)",
+                 "kNN-LM", "Where the retrieval's gain comes from", "make_streamret_arm.sh", "STREAMRET_CUTS=860,900",
+                 "STREAM_RETRIEVAL=1 NUM_SCHEDULED_ITERATIONS=860 ./run.sh", "in-run gain", "30.00 millinats",
+                 "Stream retrieval with its step cut (pilot only, not pooled: streamret860 vs stack963)",
+                 "off by default in the logged source", "valid probability model", "860 scheduled steps (932 trained)",
+                 "must become 860", "READY FOR A PR: yes"):
+        assert text in readme, text
+    verdict = (node["runs"] / "verdict.txt").read_text()
+    assert "stream retrieval, with the 860-step cut): YES" in verdict and "streamret arm" in verdict
+    assert "make_streamret_arm.sh" in verdict and str(node["dirs"]["streamret"]) in verdict
+
+
 def test_runs_outside_work_is_refused(tmp_path):
     node = make_node(tmp_path)
     node["env"]["RUNS"] = str(tmp_path / "elsewhere")
@@ -426,6 +511,8 @@ def test_preflight_checks_that_run_on_cpu(tmp_path, capsys):
     preflight.check_python()
     if shutil.which("gcc") or shutil.which("clang"):
         preflight.check_toolchain()
+        preflight.check_stream_helper(REPO)  # the streamret arm's C helper
+        assert "stream-retrieval helper builds" in capsys.readouterr().out
     # The stack's canonical-mask builder starts with `python -P` (3.11+) and needs tiktoken's GPT-2 files.
     try:
         import tiktoken

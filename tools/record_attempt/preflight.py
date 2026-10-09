@@ -12,6 +12,7 @@ refuse the anonymous kernels request, and then the cache is pre-seeded from the 
 import argparse
 import datetime
 import importlib.metadata
+import importlib.util
 import os
 import re
 import shutil
@@ -224,6 +225,21 @@ def check_tokenizer(stack: Path):
     ok("tiktoken gpt2 cached; #375's token normalization map matches its sha256")
 
 
+def check_stream_helper(stack: Path):
+    """The streamret arm (STREAMRET_CUTS) compiles its C helper with the node's C compiler before its clock; a missing
+    compiler or a build error would crash every one of its legs. Builds it exactly as the trainer does
+    (stream_memory.build_helper, from the overlay the arm is made of; the build is cached by the source's hash)."""
+    module = stack / "tools/stream_retrieval/arm/track_1_short/stream_memory.py"
+    spec = importlib.util.spec_from_file_location("stream_memory_overlay", module)
+    stream_memory = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(stream_memory)
+        helper = stream_memory.build_helper()
+    except Exception as e:  # noqa: BLE001 - any failure here would crash every streamret leg
+        fail(f"the stream-retrieval helper does not build ({module}): {tail(str(e))}")
+    ok(f"the stream-retrieval helper builds ({helper})")
+
+
 def check_mask_builder(stack: Path):
     """The stack starts its canonical-mask builder as `python -P canonical_mask_build.py` and checks it before the
     clock; a failure there crashes the leg, so the stack would lose its smoke leg to an environment problem."""
@@ -266,6 +282,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--stack", required=True, help="the stack checkout (FA3 pin and #375's map are read from it)")
     parser.add_argument("--runs", required=True)
+    parser.add_argument("--stream-helper", action="store_true", help="the attempt has the streamret arm")
     args = parser.parse_args()
     stack, runs = Path(args.stack).resolve(), Path(args.runs).resolve()
     runs.mkdir(parents=True, exist_ok=True)
@@ -280,6 +297,8 @@ def main():
     check_fa3(stack, runs)
     check_tokenizer(stack)
     check_mask_builder(stack)
+    if args.stream_helper:
+        check_stream_helper(stack)
     (runs / "environment.txt").write_text(environment_report(found))
     ok(f"environment report in {runs / 'environment.txt'}")
 

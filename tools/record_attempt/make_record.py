@@ -16,7 +16,9 @@ import record_stats
 HERE = Path(__file__).resolve().parent
 MASTER_PUBLISHED_S = 39.9   # record #92 (ANVIL2) as published
 PR379_PUBLISHED_S = 36.009  # #379's own same-node pool
-DEFAULT_NAMES = {"stack": "CPLMNormHashesSystems", "mlonly": "CPLMNormHashes"}
+DEFAULT_NAMES = {"stack": "CPLMNormHashesSystems", "mlonly": "CPLMNormHashes",
+                 "streamret": "CPLMNormHashesSystemsStreamRetrieval"}
+RETRIEVAL_RE = re.compile(r"^step:\d+ stream_retrieval val_loss_lm:([\d.]+) val_loss_mixed:([\d.]+) gain:(-?[\d.]+)mnat", re.M)
 
 CHANGES_ML = """\
 - **#379, CPLM** (copy-sink pointer LM): the next-token distribution is a mixture of the LM softmax and a pointer
@@ -38,6 +40,52 @@ CHANGES_SYSTEMS = """\
     the clock); the pinned batch staging it shares takes a lock;
   - every rank starts its clock after a barrier, so rank 0's pre-clock mask setup no longer lets other ranks'
     on-clock work start before the reported clock."""
+
+
+CHANGES_RETRIEVAL = """\
+- **Stream-only retrieval at the final validation** (`STREAM_RETRIEVAL=1`, `track_1_short/stream_memory.py` and
+  `stream_memory.c`): the CPLM probability p of each val token is mixed with a next-token distribution read from an
+  exact-match memory, q = (1 - lambda) p + lambda C/N. The memory holds only the tokens this run trains on: rank 0's
+  loader passes the document spans it already computes for all 8 ranks to a C helper process, which reads them from
+  the shards and indexes them (a hash chain over 6-token contexts) as batches are fetched, on the clock. At the last
+  step the helper queries every val position (#367's StreamIndex row rule: the deepest match level up to 32 tokens
+  within the model's own context over the 32 most recent occurrences; a 4-constant gate) before the clock stops; each
+  rank copies its rows to the GPU. No model, training or token-stream change: every log has `val_loss_lm` (the same
+  weights unmixed) next to the mixed `val_loss`, the gain measured in-run."""
+
+# Where the retrieval's gain comes from, measured on CPU proxies (tools/stream_retrieval/README.md): disclosed in
+# every streamret record, since it is what a maintainer weighs when deciding whether the memory is acceptable.
+RETRIEVAL_CONCENTRATION = (
+    "- **Where the retrieval's gain comes from** (CPU proxies on the real 1050-step stream; not measured on this "
+    "model): from val documents that share long verbatim passages with documents the run trained on, mostly web "
+    "boilerplate. The top 1% of val documents carry 30-47% of the gain and the top 5% 65-92%; positions matched at 32 "
+    "tokens are 0.3-0.4% of val and carry 31-37%, and at 97% of them every retrieved continuation is the target. The "
+    "largest single contributor in the first 1M val tokens is a local-news site's \"most read\" sidebar whose 276-token "
+    "list also appears in a trained document (10% of that proxy's whole gain). The memory never holds a val token: "
+    "these are passages the training stream itself contains.")
+
+RETRIEVAL_CREDITS = (
+    "No code from another PR; the design builds on two. PR #367 (Herman Brunborg): exact-match retrieval from training "
+    "data on this track, and its StreamIndex, whose stream layout (each rank's documents step by step, a STOP after "
+    "each) and row rule (6-token key, the most recent occurrences, the deepest level reached, the next tokens of the "
+    "occurrences at least that deep, (length, count, top share) as features) this memory follows. PR #380 (Deven): "
+    "mixing CPLM's p at the output with the retrieved count share, (1 - lam) p + lam C/N, under a sigmoid gate on "
+    "(order, log2 N) fitted on training positions. kNN-LM (Khandelwal et al., 2020) and Infini-gram (Liu et al., "
+    "2024); the LZ77/zlib hash chain. This PR's part: the memory restricted to the run's own consumed stream and used "
+    "at the final validation, the hash-chain index and C helper fed from the loader's spans on the clock, the single "
+    "longest-match link with its 4-constant gate. Nothing from #381.")
+
+
+def retrieval_gain(runs) -> str:
+    """The in-run paired gain (val_loss_lm - val_loss on the same weights) over the finished runs' logs."""
+    found = [m for r in runs if r.val is not None for m in RETRIEVAL_RE.findall(Path(r.path).read_text(errors="replace"))]
+    if not found:
+        return "n/a"
+    gains = [float(g) for _, _, g in found]
+    lm = sum(float(a) for a, _, _ in found) / len(found)
+    sd = (sum((g - sum(gains) / len(gains)) ** 2 for g in gains) / max(len(gains) - 1, 1)) ** 0.5
+    return (f"{sum(gains) / len(gains):.2f} millinats (sd {sd:.2f}, {len(gains)} runs; unmixed val_loss_lm mean "
+            f"{lm:.5f})")
 
 
 def git(directory: Path, *args: str) -> str:
@@ -257,7 +305,8 @@ def build(runs: Path, state: dict, decision: dict, arms: dict[str, Path], record
     first_done = next((r.path for r in this_pr if r.val is not None), None)
     stack_info = log_stack(first_done) if first_done else {}
     trained = steps + 72
-    env_var = f"NUM_SCHEDULED_ITERATIONS={steps}"
+    retrieval = family == "streamret"
+    env_var = ("STREAM_RETRIEVAL=1 " if retrieval else "") + f"NUM_SCHEDULED_ITERATIONS={steps}"
     if family == "mlonly":
         merged = {k: git(cand_dir, "rev-parse", ref) or "n/a" for k, ref in  # make_mlonly_arm.sh's two merges
                   (("master", "HEAD^1^1"), ("pr375", "HEAD^1^2"), ("pr379", "HEAD^2"), ("tree", "HEAD^{tree}"))}
@@ -267,6 +316,11 @@ def build(runs: Path, state: dict, decision: dict, arms: dict[str, Path], record
                      "(make_mlonly_arm.sh rebuilds it), plus this record folder, which was written into the stack "
                      "checkout's records/")
         increment = "#375" + (", with the 963-step cut" if steps == 963 else "")
+    elif retrieval:
+        pr_source = (f"the streamret arm {cand_dir} (`{heads['streamret'][:7]}`: the stack {branch} @ {heads['stack'][:7]} "
+                     "plus tools/stream_retrieval's overlay, one commit by make_streamret_arm.sh), plus this record "
+                     "folder, which was written into the stack checkout's records/")
+        increment = f"#375 + the systems patches + stream retrieval, with the {steps}-step cut"
     else:
         pr_source = f"the stack checkout {cand_dir} ({branch} @ {heads['stack'][:7]}), with this record folder in it"
         increment = "#375 + the systems patches" + (", with the 963-step cut" if steps == 963 else "")
@@ -276,12 +330,19 @@ def build(runs: Path, state: dict, decision: dict, arms: dict[str, Path], record
                  f"node; here they took {fmt(s_master['wall_mean'], 3)} s and {fmt(s_pr379['wall_mean'], 3)} s, so this node "
                  f"is {100 * (s_master['wall_mean'] / MASTER_PUBLISHED_S - 1):+.1f} % against #92's. The deltas above are "
                  "same-node (rule 4).")
-    what = ("CPLM (#379) + token-normalized n-gram hashes (#375) + host-side systems patches" if family == "stack"
-            else "CPLM (#379) + token-normalized n-gram hashes (#375)")
+    what = {"stack": "CPLM (#379) + token-normalized n-gram hashes (#375) + host-side systems patches",
+            "streamret": "CPLM (#379) + token-normalized n-gram hashes (#375) + host-side systems patches + stream-only "
+                         "retrieval"}.get(family, "CPLM (#379) + token-normalized n-gram hashes (#375)")
     source = (cand_dir / "train_gpt.py").read_text() if (cand_dir / "train_gpt.py").exists() else ""
     default = m.group(1) if (m := re.search(r'"NUM_SCHEDULED_ITERATIONS", "(\d+)"', source)) else "?"
     caches = "empty for every leg" if state["settings"]["cold"] else "warm after the first leg of each arm"
     systems_alone = ""
+    if retrieval:
+        base = decision.get("base", "")
+        c = record_stats.compare(pilot[decision["arm"]], pilot[base]) if base in pilot and decision["arm"] in pilot else None
+        systems_alone = (delta_line(f"Stream retrieval with its step cut (pilot only, not pooled: {decision['arm']} vs "
+                                    f"{base})", c) + f"\n- Stream retrieval's in-run gain (val_loss_lm - val_loss, same "
+                         f"weights) in the certification pool: {retrieval_gain(this_pr)}.")
     if family == "stack":
         c = (record_stats.compare(pilot["stack978"], pilot["mlonly978"])
              if "stack978" in pilot and "mlonly978" in pilot else None)
@@ -319,7 +380,8 @@ def build(runs: Path, state: dict, decision: dict, arms: dict[str, Path], record
     step_disclosure = (
         f"- **Step count.** Every candidate leg set `{env_var}` in its environment (ab_bench `--arm-env`), and each "
         f"log shows `step:N/{trained}`. "
-        + ("That equals the default in `train_gpt.py`, so the logged source is the shipped source." if default == str(steps)
+        + ("That equals the default in `train_gpt.py`." if default == str(steps) and retrieval else
+           "That equals the default in `train_gpt.py`, so the logged source is the shipped source." if default == str(steps)
            else f"The logged source's default is {default}: before merging, `train_gpt.py`'s default must become {steps}, "
            "the only difference from the logged source (as in #379's own README)."))
     all_runs = (f"- All {s_shipped['n']} runs of the shipped configuration ({' + '.join(f'`{k}/`' for k in shipped)}; "
@@ -327,7 +389,17 @@ def build(runs: Path, state: dict, decision: dict, arms: dict[str, Path], record
                 "check, not the claim: the pilot legs fed the pre-registered decision, so only the fresh pool above "
                 "enters rule 2." if shipped else "")
     sxm = (", SXM (NVLink NV18 in `nvidia-smi topo -m`, `environment.txt`)" if "NV18" in env_text else "")
-    if family == "mlonly":
+    if retrieval:
+        cuts = ",".join(map(str, state["settings"].get("streamret_cuts") or [steps]))
+        reproduce = [
+            f"git clone -b {branch} {origin} modded-nanogpt && cd modded-nanogpt   # the fork: the stack and the protocol",
+            f"STREAMRET_CUTS={cuts} bash tools/record_attempt/run.sh   # the whole protocol, with the streamret arm",
+            "# the certified code: the stack plus the stream-retrieval overlay (tools/stream_retrieval/arm):",
+            "ARM=$(bash tools/stream_retrieval/make_streamret_arm.sh)   # prints ../record_work/streamret",
+            f'cd "$ARM" && python data/cached_fineweb10B.py 9 && {env_var} ./run.sh',
+            f"python records/track_1_short/{folder.name}/statistics.py   # from the fork, where this folder was written",
+        ]
+    elif family == "mlonly":
         reproduce = [
             f"git clone -b {branch} {origin} modded-nanogpt && cd modded-nanogpt   # the fork: the protocol's scripts",
             "bash tools/record_attempt/run.sh   # the whole protocol: setup, smoke, pilot, decision, certification, this folder",
@@ -373,7 +445,7 @@ def build(runs: Path, state: dict, decision: dict, arms: dict[str, Path], record
         "## Changes",
         "",
         CHANGES_ML,
-        *([CHANGES_SYSTEMS] if family == "stack" else
+        *([CHANGES_SYSTEMS, CHANGES_RETRIEVAL] if retrieval else [CHANGES_SYSTEMS] if family == "stack" else
           [f"- No systems patches: the ML-only arm, {mlonly_what}, was certified (`tools/record_attempt/make_mlonly_arm.sh` "
            f"in the fork, {fork}, builds it)."]),
         f"- **Step count**: {steps} scheduled steps ({trained} trained), chosen by the pre-registered rule below.",
@@ -382,8 +454,9 @@ def build(runs: Path, state: dict, decision: dict, arms: dict[str, Path], record
         "",
         "- #379 (CPLM): @NathanGodey and @yoavartzi.",
         "- #375 (token-normalized n-gram hashes): Daniel Monroe.",
-        f"- {'Systems patches, integration' if family == 'stack' else 'Integration'} and this certification: "
-        f"{'@' + owner if owner else '(author)'}.",
+        f"- {'Systems patches, integration' if family in ('stack', 'streamret') else 'Integration'} and this "
+        f"certification: {'@' + owner if owner else '(author)'}.",
+        *([f"- Stream-only retrieval: {'@' + owner if owner else '(author)'}. {RETRIEVAL_CREDITS}"] if retrieval else []),
         "",
         "## Rules checklist",
         "",
@@ -393,9 +466,20 @@ def build(runs: Path, state: dict, decision: dict, arms: dict[str, Path], record
                                 "the record's schedule (1122 scheduled steps) and the stack's at 978, plus the validation, "
                                 "through master's loader and this one: byte-identical"
                                 + (" (963 is not replayed there)." if steps == 963 else ".")
-                                if family == "stack" else ""),
+                                if family in ("stack", "streamret") else "")
+        + (" Stream retrieval reads the span lists the loader already computes and nothing else; its memory is a verbatim "
+           "copy of the tokens this run trained on (every fetched timed batch, no unread shard byte, no val token) that "
+           "returns exact continuations at validation, a nonparametric store unlike the learned n-gram table (whether it "
+           "is acceptable is a question for the maintainers); `tools/stream_retrieval/test_stream_retrieval.py` checks "
+           "the batches stay byte-identical with the tap on, the memory equals every rank's trained tokens, and nothing "
+           "else is read."
+           if retrieval else ""),
         f"2. **Mean val ≤ 3.28 at p < 0.01**: p = {cand['p']:.2g} over {cand['finished']} runs, all counted "
-        f"({'PASS' if cand['p'] < 0.01 else 'FAIL'}).",
+        f"({'PASS' if cand['p'] < 0.01 else 'FAIL'})."
+        + (" The retrieval mixture is a valid probability model: r_t sums to 1 over the vocabulary and depends on the "
+           "memory and val[<= t] only, lambda_t on (N, M, L*) only, so the mixture sums to <= 1 at every position; it is "
+           "forward-only, nothing is learned from val, and the memory is built and queried inside the timed region."
+           if retrieval else ""),
         "3. **No new compile or inductor flags**: `git diff " + heads["master"][:7] + " -- train_gpt.py track_1_short/ "
         "| grep -E '_inductor|torch.compile|dynamo.config'` adds "
         + ("nothing." if rule3 and not rule3_hits else
@@ -437,6 +521,22 @@ def build(runs: Path, state: dict, decision: dict, arms: dict[str, Path], record
         "- **#375's normalization map** is built at import, before the clock (~45-70 ms); the record's convention puts "
         "tokenizer-derived tables on the clock, so a reviewer may ask for it to move.",
         "- **#379's validation NLL** is `-log(p + 1e-9)`, within 5e-5 nats of a normalized model (disclosed in #379).",
+        *(["- **Stream retrieval is off by default in the logged source**: every candidate leg set `STREAM_RETRIEVAL=1`. "
+           "Before merging, the record settings at the top of `train_gpt.py` must also set it (with the step count), the "
+           "only other difference from the logged source.",
+           "- **Before the clock** the stream retrieval only compiles its C helper (`cc -O2`), spawns it and lets it "
+           "allocate and prefault its arrays (~3.7 GB of host RAM), and maps an 84 MB rows file on every rank: the same "
+           "kind of setup as the canonical mask's buffer. Everything it computes happens on the clock: insertion as "
+           "batches are fetched, the val read and the queries after the last step, the copy to the GPUs before the clock "
+           "stops. A checksum of each rank's val chunk is verified after the clock stops (a check only).",
+           "- **The gate's 4 constants** (`W` in `stream_memory.py`) are hyperparameters, never fitted on val: they were "
+           "fitted on held-out training data (training batches past a 1050-step stream, scored by a CPU proxy LM never "
+           "trained on FineWeb; provenance in the source comment). A run with `STREAM_RETRIEVAL_FIT` refits them on this "
+           "model from 64 training batches past the run's stream (`tools/stream_retrieval/fit_gate.py`).",
+           "- **The C helper** (`track_1_short/stream_memory.c`, ~600 lines with comments; C11 and pthreads, no new "
+           "dependency) is new to the repo; the run logs embed it with the Python source.",
+           RETRIEVAL_CONCENTRATION]
+          if retrieval else []),
         notes.rstrip(),
         "",
         "## Hardware and stack",

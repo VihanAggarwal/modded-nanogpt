@@ -3,7 +3,9 @@
 `run.sh` takes a fresh 8xH100 SXM node to a record folder ready for a PR, with a short verdict. It runs the protocol
 the merged records use: an interleaved same-node pool, a same-node baseline of the merged record (master `4ea6b93`),
 the open PR this one builds on (#379) measured alongside, every leg counted, and
-`scipy.stats.ttest_1samp(vals, 3.28, alternative='less')`.
+`scipy.stats.ttest_1samp(vals, 3.28, alternative='less')`. With `STREAMRET_CUTS` set, the pilot also tries the stack
+plus stream-only retrieval (`streamret`, its own arm) at those step cuts; it becomes the candidate only if it beats
+the plain stack's pilot beyond noise (rule 4, below).
 
 ## What to rent
 
@@ -41,18 +43,29 @@ cd modded-nanogpt && tmux new -s rec 'bash tools/record_attempt/run.sh; exec bas
    Then `preflight.py` runs, off the books, what a leg needs: a Triton kernel compiled and launched on `cuda:0` (it
    needs gcc and `Python.h`), an NCCL all_reduce over the 8 GPUs, the pinned FA3 kernel (`devenpzak/flash-attn3-12864`
    @ `64c1e6d1`, sha256-checked as `load_flash_attn3` does), #375's token-normalization map, tiktoken's GPT-2 files,
-   and the stack's canonical-mask builder; it writes `environment.txt`. Once FA3 loads from the local cache, every
-   leg runs with `HF_HUB_OFFLINE=1`, so no counted leg depends on the Hub answering. No HF token is needed: if the
-   Hub refuses the anonymous kernels request (the 401 in the ANVIL2 README), the cache is pre-seeded from the model
-   repo. Trainer knobs inherited from the shell (`NUM_SCHEDULED_ITERATIONS`, `TRAIN_SEED`, `CPLM_*`,
-   `TORCHINDUCTOR_*`, ...) are unset, so every leg runs each arm's defaults.
+   the stack's canonical-mask builder (and with `STREAMRET_CUTS` the stream-retrieval helper's build); it writes
+   `environment.txt`. Once FA3
+   loads from the local cache, every leg runs with `HF_HUB_OFFLINE=1`, so no counted leg depends on the Hub
+   answering. No HF token is needed: if the Hub refuses the anonymous kernels request (the 401 in the ANVIL2 README),
+   the cache is pre-seeded from the model repo. Trainer knobs inherited from the shell (`NUM_SCHEDULED_ITERATIONS`,
+   `TRAIN_SEED`, `CPLM_*`, `TORCHINDUCTOR_*`, ...) are unset, so every leg runs each arm's defaults.
 2. **Arms**: `master` (worktree of `4ea6b937`), `pr379` (worktree of #379's head `c44cc41e`), `stack` (this checkout:
    the systems patches + #375 + #379), and `mlonly` (#379 + #375 on master without the systems patches, built by
    `make_mlonly_arm.sh` from the same pinned heads even if an author has pushed since; if the build fails the attempt
-   goes on without it and says so).
+   goes on without it and says so), and, only with `STREAMRET_CUTS`, `streamret`: a worktree of this checkout's HEAD
+   plus `tools/stream_retrieval`'s overlay in one commit, built by `tools/stream_retrieval/make_streamret_arm.sh`, run
+   with `STREAM_RETRIEVAL=1`. The stack's own checkout carries none of the retrieval code, so a stack record's source
+   is only the stack.
 3. **Phase A, smoke**: one leg of the stack at 978 scheduled steps; if it crashes, one leg of `mlonly`.
 4. **Phase B, pilot**: 3 legs per arm, interleaved: master, pr379, the candidate at 978 and at 963 scheduled steps
-   (`NUM_SCHEDULED_ITERATIONS=963`), and mlonly at 978.
+   (`NUM_SCHEDULED_ITERATIONS=963`), mlonly at 978, and with `STREAMRET_CUTS` streamret at those cuts (only if the
+   stack finished its smoke leg). Retrieval does not change training, so its gain only pays as a step cut, and the
+   cuts come from a measured gain, never a guess: run one `STREAM_RETRIEVAL=1` dev run first
+   (`tools/stream_retrieval/README.md`, G1) and read its `gain:` line, g millinats. A cut of s scheduled steps passes
+   the 3.2765 gate only if g >= 0.25 x (978 - s) + ~0.4 (0.25 millinats per step from the CPLM README, #379's
+   978-step mean 3.27686), and the loss curve is steeper at fewer steps than that linear rate, so pre-register a safe
+   cut and a bolder one, e.g. s = 978 - 4 x (g - 3) and s = 978 - 4 x (g - 0.5), rounded to 10. Each streamret log
+   also reports `val_loss_lm`, the same weights without the mixture, so every leg measures the gain in-run.
 5. **Phase C, decision** by the rule below, written to `runs/PREREGISTRATION.txt` before the first leg.
 6. **Phase D, certification**: a fresh interleaved pool, candidate n=12, master n=6, #379 n=6.
 7. **Report**: `records/track_1_short/<date>_<name>/` with `README.md` (tables, deltas, changes, credits, rules
@@ -76,14 +89,26 @@ PRE-REGISTERED DECISION RULE (fixed before the first leg; applied by tools/recor
    pilot legs are reported, never pooled.
 ```
 
-If the stack fails its smoke leg, the pilot runs mlonly at 978 and 963 in its place.
+With `STREAMRET_CUTS=S1,S2` the rule gains a step before certification (which becomes 5):
+
+```
+4. Stream retrieval: streamret (the stack plus stream retrieval, STREAM_RETRIEVAL=1) runs 3 pilot legs at
+   each of S1 and S2 scheduled steps (cuts set from a dev run's measured gain). Its step count is
+   the lowest of these whose 3 legs all finished with a mean final val <= 3.2765; if none, it is not
+   eligible. It replaces the candidate of rules 2-3 only if all its pilot legs finished and its pilot train time at
+   that step count is below the candidate's (at the step count of rule 3) by more than twice the Welch standard
+   error of the difference.
+```
+
+If the stack fails its smoke leg, the pilot runs mlonly at 978 and 963 in its place, and no streamret legs.
 
 ## Time and cost
 
 40 legs (1 smoke + 15 pilot + 24 certification) at ~2-3 min each with warm compile caches, 4 first-time compiles
 at ~7 min (one per arm's source), ~15 min of setup (venv, ~2 GB of data, the kernel): **about 2-2.7 hours, $30-90 at
-$15-32 per node-hour.** These are estimates: no leg of this trainer has been timed yet (nothing here has run on a
-GPU), and a hung leg adds up to `LEG_TIMEOUT` (30 min). `run.sh` prints its estimate first, and the time of the smoke
+$15-32 per node-hour.** With `STREAMRET_CUTS` (two cuts): 46 legs and one more compile, about 2.4-3.1 hours. These
+are estimates: no leg of this trainer has been timed yet (nothing here has run on a GPU), and a hung leg adds up to
+`LEG_TIMEOUT` (30 min). `run.sh` prints its estimate first, and the time of the smoke
 leg once it is done. `COLD=1` (empty caches every leg, the ANVIL2 convention) adds ~7 min per leg, about 5 more hours.
 
 ## Resuming and stopping
@@ -130,21 +155,26 @@ VERDICT block from the end of the output (also in `runs/verdict.txt`).
 `WORK`), `VENV_PYTHON` (the python >= 3.11 the venv is built from), `PYTHON` (use this python >= 3.11 instead of a
 venv), `LEGS_PILOT=3`, `LEGS_CERT=12`, `LEGS_CERT_BASE=6`, `COLD=1`, `MAX_CRASHES=2`, `LEG_TIMEOUT=1800` (seconds
 before a hung leg is killed, compile included; it counts as a crash), `RECORD_NAME`, `ALLOW_NEW_MASTER=1`,
-`ALLOW_PR_DRIFT=1` (build mlonly from the PRs' current heads instead of the pins). For tests:
-`SETUP=0` (no node setup), `LEG_COMMAND`, `STACK_DIR`, `MASTER_DIR`, `PR379_DIR`, `MAKE_MLONLY`, `RECORDS_DIR`.
+`ALLOW_PR_DRIFT=1` (build mlonly from the PRs' current heads instead of the pins), `STREAMRET_CUTS=S1,S2` (add the
+stream-retrieval arm at these scheduled step counts; set it before the first leg, since the attempt's arms and rule are
+fixed then). For tests: `SETUP=0` (no node setup), `LEG_COMMAND`, `STACK_DIR`, `MASTER_DIR`, `PR379_DIR`,
+`MAKE_MLONLY`, `MAKE_STREAMRET`, `RECORDS_DIR`.
 
 ## Files
 
 - `run.sh`: setup, preflight, arms, then `attempt.py`.
 - `preflight.py`: the Python-side checks (Python 3.11+, pinned packages, GPUs, headers, C compiler and `Python.h`,
-  a Triton kernel, NCCL over 8 GPUs, FA3, tokenizer, the canonical-mask builder) and `environment.txt`.
+  a Triton kernel, NCCL over 8 GPUs, FA3, tokenizer, the canonical-mask builder, and with `STREAMRET_CUTS` the
+  stream-retrieval helper's build) and `environment.txt`.
 - `attempt.py`: phases A-D through `tools/speedrun_ab/ab_bench.py` (one `--out` per phase), the rule, the verdict.
 - `make_record.py`: the record folder and its README. `record_stats.py`: the statistics (the folder's `statistics.py`).
 - `make_mlonly_arm.sh`: the ML-only arm.
 - `test_record_attempt.py`: CPU tests: the statistics on #379's own logs, the rule, and `run.sh` end to end with a
-  fake trainer (both step counts, the mlonly fallback, a crash stop and a second attempt, a kill and resume, a leg
-  that dies before its log, a failed setup check).
+  fake trainer (both step counts, the mlonly fallback, stream retrieval winning with its cut, a crash stop and a second
+  attempt, a kill and resume, a leg that dies before its log, a failed setup check).
 
-Nothing here has run on a GPU. The node-specific parts (the checks against `nvidia-smi`, the venv, uv and wheel
+Nothing here has run on a GPU, and neither has stream retrieval: its gain on this model, its on-clock cost and its
+rows' readiness before the clock stops are unmeasured until one `STREAM_RETRIEVAL=1` dev run. The node-specific
+parts (the checks against `nvidia-smi`, the venv, uv and wheel
 installs, the Triton, NCCL and FA3 checks, `libcudart.so.13` and `CUDA_HOME` discovery) are exercised only by
 `--dry-run` on CPU.
