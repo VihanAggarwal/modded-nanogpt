@@ -54,14 +54,19 @@ cd modded-nanogpt && tmux new -s rec 'bash tools/record_attempt/run.sh; exec bas
    `make_mlonly_arm.sh` from the same pinned heads even if an author has pushed since; if the build fails the attempt
    goes on without it and says so), and, only with `STREAMRET_CUTS`, `streamret`: a worktree of this checkout's HEAD
    plus `tools/stream_retrieval`'s overlay in one commit, built by `tools/stream_retrieval/make_streamret_arm.sh`, run
-   with `STREAM_RETRIEVAL=1`. The stack's own checkout carries none of the retrieval code, so a stack record's source
-   is only the stack.
+   with `STREAM_RETRIEVAL=1` (and with `STREAMRET_LOW=1` also `STREAM_RETRIEVAL_LOW=1`: the exact low-order tables,
+   ~15 GB more host RAM and ~4-6 cores during training; preflight checks the RAM). The stack's own checkout carries
+   none of the retrieval code, so a stack record's source is only the stack. Every cut needs the gate's constants
+   fitted on our model at its own step count (a FIT dev run at that `NUM_SCHEDULED_ITERATIONS`, then
+   `fit_gate_v2.py --module`, committed; `tools/stream_retrieval/README.md`, G3): preflight refuses a cut without
+   them, and the CPU placeholders shipped with the overlay never pass.
 3. **Phase A, smoke**: one leg of the stack at 978 scheduled steps; if it crashes, one leg of `mlonly`.
 4. **Phase B, pilot**: 3 legs per arm, interleaved: master, pr379, the candidate at 978 and at 963 scheduled steps
    (`NUM_SCHEDULED_ITERATIONS=963`), mlonly at 978, and with `STREAMRET_CUTS` streamret at those cuts (only if the
    stack finished its smoke leg). Retrieval does not change training, so its gain only pays as a step cut, and the
-   cuts come from a measured gain, never a guess: run one `STREAM_RETRIEVAL=1` dev run first
-   (`tools/stream_retrieval/README.md`, G1) and read its `gain:` line, g millinats. A cut of s scheduled steps passes
+   cuts come from a measured gain, never a guess: run the dev runs first (`tools/stream_retrieval/README.md`: G1 fits
+   the gate on the run's own batches, G2 measures with it, with the same `STREAM_RETRIEVAL_LOW` as the attempt, and
+   G3 fits it at each cut) and read G2's `gain:` line, g millinats. A cut of s scheduled steps passes
    the 3.2765 gate only if g >= 0.25 x (978 - s) + ~0.4 (0.25 millinats per step from the CPLM README, #379's
    978-step mean 3.27686), and the loss curve is steeper at fewer steps than that linear rate, so pre-register a safe
    cut and a bolder one, e.g. s = 978 - 4 x (g - 3) and s = 978 - 4 x (g - 0.5), rounded to 10. Each streamret log
@@ -92,7 +97,7 @@ PRE-REGISTERED DECISION RULE (fixed before the first leg; applied by tools/recor
 With `STREAMRET_CUTS=S1,S2` the rule gains a step before certification (which becomes 5):
 
 ```
-4. Stream retrieval: streamret (the stack plus stream retrieval, STREAM_RETRIEVAL=1) runs 3 pilot legs at
+4. Stream retrieval: streamret (the stack plus stream retrieval, STREAM_RETRIEVAL=1[ STREAM_RETRIEVAL_LOW=1]) runs 3 pilot legs at
    each of S1 and S2 scheduled steps (cuts set from a dev run's measured gain). Its step count is
    the lowest of these whose 3 legs all finished with a mean final val <= 3.2765; if none, it is not
    eligible. It replaces the candidate of rules 2-3 only if all its pilot legs finished and its pilot train time at
@@ -157,7 +162,7 @@ venv), `LEGS_PILOT=3`, `LEGS_CERT=12`, `LEGS_CERT_BASE=6`, `COLD=1`, `MAX_CRASHE
 before a hung leg is killed, compile included; it counts as a crash), `RECORD_NAME`, `ALLOW_NEW_MASTER=1`,
 `ALLOW_PR_DRIFT=1` (build mlonly from the PRs' current heads instead of the pins), `STREAMRET_CUTS=S1,S2` (add the
 stream-retrieval arm at these scheduled step counts; set it before the first leg, since the attempt's arms and rule are
-fixed then). For tests: `SETUP=0` (no node setup), `LEG_COMMAND`, `STACK_DIR`, `MASTER_DIR`, `PR379_DIR`,
+fixed then), `STREAMRET_LOW=1` (that arm with `STREAM_RETRIEVAL_LOW=1`; also fixed at the first leg). For tests: `SETUP=0` (no node setup), `LEG_COMMAND`, `STACK_DIR`, `MASTER_DIR`, `PR379_DIR`,
 `MAKE_MLONLY`, `MAKE_STREAMRET`, `RECORDS_DIR`.
 
 ## Files
@@ -165,16 +170,18 @@ fixed then). For tests: `SETUP=0` (no node setup), `LEG_COMMAND`, `STACK_DIR`, `
 - `run.sh`: setup, preflight, arms, then `attempt.py`.
 - `preflight.py`: the Python-side checks (Python 3.11+, pinned packages, GPUs, headers, C compiler and `Python.h`,
   a Triton kernel, NCCL over 8 GPUs, FA3, tokenizer, the canonical-mask builder, and with `STREAMRET_CUTS` the
-  stream-retrieval helper's build) and `environment.txt`.
+  stream-retrieval helper's build, its gate's fit to the parts and, for every cut, constants fitted on our model at
+  that step count, and the host RAM for the retrieval) and `environment.txt`.
 - `attempt.py`: phases A-D through `tools/speedrun_ab/ab_bench.py` (one `--out` per phase), the rule, the verdict.
 - `make_record.py`: the record folder and its README. `record_stats.py`: the statistics (the folder's `statistics.py`).
 - `make_mlonly_arm.sh`: the ML-only arm.
 - `test_record_attempt.py`: CPU tests: the statistics on #379's own logs, the rule, and `run.sh` end to end with a
-  fake trainer (both step counts, the mlonly fallback, stream retrieval winning with its cut, a crash stop and a second
+  fake trainer (both step counts, the mlonly fallback, stream retrieval winning with its cut, with and without the
+  low-order tables, a crash stop and a second
   attempt, a kill and resume, a leg that dies before its log, a failed setup check).
 
 Nothing here has run on a GPU, and neither has stream retrieval: its gain on this model, its on-clock cost and its
-rows' readiness before the clock stops are unmeasured until one `STREAM_RETRIEVAL=1` dev run. The node-specific
+rows' readiness before the clock stops are unmeasured until the `STREAM_RETRIEVAL=1` dev runs. The node-specific
 parts (the checks against `nvidia-smi`, the venv, uv and wheel
 installs, the Triton, NCCL and FA3 checks, `libcudart.so.13` and `CUDA_HOME` discovery) are exercised only by
 `--dry-run` on CPU.

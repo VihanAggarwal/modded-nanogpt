@@ -225,19 +225,68 @@ def check_tokenizer(stack: Path):
     ok("tiktoken gpt2 cached; #375's token normalization map matches its sha256")
 
 
-def check_stream_helper(stack: Path):
-    """The streamret arm (STREAMRET_CUTS) compiles its C helper with the node's C compiler before its clock; a missing
-    compiler or a build error would crash every one of its legs. Builds it exactly as the trainer does
-    (stream_memory.build_helper, from the overlay the arm is made of; the build is cached by the source's hash)."""
+TRAINED_OVER_SCHEDULED = 72  # attempt.GROWTH_STEPS: the growth and extension steps trained on top of the scheduled ones
+STREAM_TOKENS = 289_480_912  # the 978-scheduled (1050-step) stream's tokens: an upper bound for any cut's
+VAL_TOKENS, WORLD = 10_485_760, 8
+TRAINER_RAM_GIB = 32         # the 8 trainer processes' own host RAM on top of the retrieval's (unmeasured: an allowance)
+
+
+def check_stream_helper(stack: Path, low: bool = False, cuts: tuple[int, ...] = ()):
+    """The streamret arm (STREAMRET_CUTS) compiles its C helper (stream_memory.c with its P2 / P3 parts) with the
+    node's C compiler before its clock, and every leg loads the gate's constants fitted at its own step count; a missing
+    compiler, a build error or a gate that does not fit would crash every one of its legs. Builds it exactly as the
+    trainer does (stream_memory.build_helper, from the overlay the arm is made of; the build is cached by the sources'
+    hash) and loads the gate as the trainer does (Gate.for_run), for every cut. A record's constants must be fitted on
+    our model at the leg's own step count (a FIT dev run at that NUM_SCHEDULED_ITERATIONS: its last batches are the
+    leg's own last batches), never a CPU proxy's placeholder (Gate.check_record)."""
+    module = stack / "tools/stream_retrieval/arm/track_1_short/stream_memory.py"
+    try:
+        stream_memory = load_stream_memory(stack)
+        helper = stream_memory.build_helper()
+        gates = {cut: stream_memory.Gate.for_run(low=low, pointer=True, steps=cut + TRAINED_OVER_SCHEDULED)
+                 for cut in cuts or (978,)}
+    except Exception as e:  # noqa: BLE001 - any failure here would crash every streamret leg
+        fail(f"the stream-retrieval helper does not build or its gate does not load ({module}): {tail(str(e))}")
+    gate = next(iter(gates.values()))
+    ok(f"the stream-retrieval helper builds ({helper}); its gate fits the parts (chain orders {gate.orders}, P3 top level)")
+    flags = "STREAM_RETRIEVAL=1 " + ("STREAM_RETRIEVAL_LOW=1 " if low else "")
+    for cut in cuts:
+        steps = cut + TRAINED_OVER_SCHEDULED
+        try:
+            gates[cut].check_record(steps)
+        except RuntimeError as e:
+            fail(f"STREAMRET_CUTS cut {cut} ({steps} trained steps): {e}.\n  A record's legs use constants fitted on our "
+                 "model at their own step count. In the streamret arm (make_streamret_arm.sh): "
+                 f"NUM_SCHEDULED_ITERATIONS={cut} {flags}STREAM_RETRIEVAL_FIT=$PWD/fit{cut} ./run.sh, then from this "
+                 f"checkout: python tools/stream_retrieval/fit_gate_v2.py <arm>/fit{cut} --module --note '<dev run, date, "
+                 "node>' and commit (tools/stream_retrieval/README.md, G3)")
+        ok(f"cut {cut}: the gate's constants were fitted at {steps} trained steps on a dev run's own last batches "
+           f"({(gates[cut].spec.get('fit') or {}).get('note') or 'no note'})")
+
+
+def load_stream_memory(stack: Path):
+    """The overlay's stream_memory.py (what make_streamret_arm.sh puts in the arm), loaded by path."""
     module = stack / "tools/stream_retrieval/arm/track_1_short/stream_memory.py"
     spec = importlib.util.spec_from_file_location("stream_memory_overlay", module)
     stream_memory = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(stream_memory)
-        helper = stream_memory.build_helper()
-    except Exception as e:  # noqa: BLE001 - any failure here would crash every streamret leg
-        fail(f"the stream-retrieval helper does not build ({module}): {tail(str(e))}")
-    ok(f"the stream-retrieval helper builds ({helper})")
+    spec.loader.exec_module(stream_memory)
+    return stream_memory
+
+
+def check_stream_ram(stack: Path, low: bool = False, avail: float | None = None):
+    """The host's RAM for the retrieval (stream_memory.host_bytes: the memory, the query arenas, the rows file, every
+    rank's pinned staging, with STREAMRET_LOW P2's tables above all) and an allowance for the 8 trainers."""
+    need = load_stream_memory(stack).host_bytes(stream_tokens=STREAM_TOKENS, val_tokens=VAL_TOKENS, world=WORLD,
+                                                low=low, pointer=True)
+    if avail is None:
+        avail = next((int(line.split()[1]) for line in Path("/proc/meminfo").read_text().splitlines()
+                      if line.startswith("MemAvailable")), 0) / 2**20
+    parts = ", ".join(f"{k.replace('_', ' ')} {v:.1f}" for k, v in need.items() if k != "total" and v)
+    if avail < need["total"] + TRAINER_RAM_GIB:
+        fail(f"{avail:.0f} GiB of host RAM available; the stream retrieval needs ~{need['total']:.0f} GiB ({parts} GiB) "
+             f"and the trainers ~{TRAINER_RAM_GIB}" + (" (STREAMRET_LOW: P2's tables)" if low else ""))
+    ok(f"{avail:.0f} GiB of host RAM available: the stream retrieval needs ~{need['total']:.0f} GiB ({parts} GiB), "
+       f"the trainers ~{TRAINER_RAM_GIB}")
 
 
 def check_mask_builder(stack: Path):
@@ -283,6 +332,8 @@ def main():
     parser.add_argument("--stack", required=True, help="the stack checkout (FA3 pin and #375's map are read from it)")
     parser.add_argument("--runs", required=True)
     parser.add_argument("--stream-helper", action="store_true", help="the attempt has the streamret arm")
+    parser.add_argument("--stream-low", action="store_true", help="... with STREAMRET_LOW (P2's low-order tables)")
+    parser.add_argument("--stream-cuts", default="", help="... at these scheduled step counts (STREAMRET_CUTS)")
     args = parser.parse_args()
     stack, runs = Path(args.stack).resolve(), Path(args.runs).resolve()
     runs.mkdir(parents=True, exist_ok=True)
@@ -298,7 +349,9 @@ def main():
     check_tokenizer(stack)
     check_mask_builder(stack)
     if args.stream_helper:
-        check_stream_helper(stack)
+        check_stream_helper(stack, low=args.stream_low,
+                            cuts=tuple(int(c) for c in args.stream_cuts.replace(" ", "").split(",") if c))
+        check_stream_ram(stack, low=args.stream_low)
     (runs / "environment.txt").write_text(environment_report(found))
     ok(f"environment report in {runs / 'environment.txt'}")
 

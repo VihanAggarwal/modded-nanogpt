@@ -5,6 +5,7 @@ re-running is safe; it never touches a folder this attempt did not write (runs/r
 README's numbers come from record_stats.py, which the folder carries as statistics.py, so `python statistics.py` in the
 folder reproduces them from the logs.
 """
+import ast
 import json
 import re
 import shutil
@@ -43,15 +44,20 @@ CHANGES_SYSTEMS = """\
 
 
 CHANGES_RETRIEVAL = """\
-- **Stream-only retrieval at the final validation** (`STREAM_RETRIEVAL=1`, `track_1_short/stream_memory.py` and
-  `stream_memory.c`): the CPLM probability p of each val token is mixed with a next-token distribution read from an
-  exact-match memory, q = (1 - lambda) p + lambda C/N. The memory holds only the tokens this run trains on: rank 0's
-  loader passes the document spans it already computes for all 8 ranks to a C helper process, which reads them from
-  the shards and indexes them (a hash chain over 6-token contexts) as batches are fetched, on the clock. At the last
-  step the helper queries every val position (#367's StreamIndex row rule: the deepest match level up to 32 tokens
-  within the model's own context over the 32 most recent occurrences; a 4-constant gate) before the clock stops; each
-  rank copies its rows to the GPU. No model, training or token-stream change: every log has `val_loss_lm` (the same
-  weights unmixed) next to the mixed `val_loss`, the gain measured in-run."""
+- **Stream-only retrieval at the final validation** (`STREAM_RETRIEVAL=1`, `track_1_short/stream_memory.py` with the
+  C helper `stream_memory.c` and its parts `stream_lowtables.c` / `stream_pointer.c`): the CPLM probability p of each
+  val token is mixed with next-token distributions read from memories of the tokens this run trained on, and nothing
+  else: rank 0's loader passes the document spans it already computes for all 8 ranks to a C helper process, which
+  reads them from the shards and indexes them (a hash chain over 6-token contexts; with `STREAM_RETRIEVAL_LOW=1` also
+  exact count tables of orders 1-5) as batches are fetched, on the clock. At the last step the helper writes, before
+  the clock stops, per val position: the memory's match record (#367's StreamIndex rule: up to 32 most recent
+  occurrences, match levels 6-32), the low orders' counts, and per segment a pointer beam, its vote and a copy from
+  source documents of the memory; each rank copies its rows to the GPU. In the untimed eval a stick-breaking chain of
+  gated Kneser-Ney components over the orders (#380's recipe) and a softmax over [chain, pointer, vote, source copy]
+  mix them with p, gated on target-independent features (counts, the model's entropy and log-probs, causal histories
+  of earlier positions); constants fitted on a dev run's own last training batches at the record's step count (the
+  same batches as the record runs' own last batches), never on val. No model, training or token-stream change: every
+  log has `val_loss_lm` (the same weights unmixed) next to the mixed `val_loss`, the gain measured in-run."""
 
 # Where the retrieval's gain comes from, measured on CPU proxies (tools/stream_retrieval/README.md): disclosed in
 # every streamret record, since it is what a maintainer weighs when deciding whether the memory is acceptable.
@@ -69,11 +75,43 @@ RETRIEVAL_CREDITS = (
     "data on this track, and its StreamIndex, whose stream layout (each rank's documents step by step, a STOP after "
     "each) and row rule (6-token key, the most recent occurrences, the deepest level reached, the next tokens of the "
     "occurrences at least that deep, (length, count, top share) as features) this memory follows. PR #380 (Deven): "
-    "mixing CPLM's p at the output with the retrieved count share, (1 - lam) p + lam C/N, under a sigmoid gate on "
-    "(order, log2 N) fitted on training positions. kNN-LM (Khandelwal et al., 2020) and Infini-gram (Liu et al., "
-    "2024); the LZ77/zlib hash chain. This PR's part: the memory restricted to the run's own consumed stream and used "
-    "at the final validation, the hash-chain index and C helper fed from the loader's spans on the clock, the single "
-    "longest-match link with its 4-constant gate. Nothing from #381.")
+    "mixing CPLM's p at the output with retrieved count distributions under sigmoid gates fitted on training "
+    "positions, chained over the match orders; the exact low-order tables (`STREAM_RETRIEVAL_LOW`) follow #380's "
+    "recipe (exact counts, a gated chain over orders, fitted on training positions), with no #380 code. kNN-LM "
+    "(Khandelwal et al., 2020), Infini-gram (Liu et al., 2024), interpolated Kneser-Ney (Chen & Goodman, 1998); the "
+    "LZ77/zlib hash chain. This PR's part: the memories restricted to the run's own consumed stream and used at the "
+    "final validation, the hash-chain index and C helper fed from the loader's spans on the clock, the records and "
+    "their GPU-side gated chain with model-aware features, the pointer beam / vote / source copy, the fit on the run's "
+    "own last batches. Nothing from #381.")
+
+
+def gate_fit(arm_dir: Path, low: bool, trained: int) -> dict | None:
+    """The 'fit' provenance of the streamret arm's constants for runs of `trained` steps (GATE_V2 / GATE_V2_LOW in its
+    track_1_short/stream_memory.py, read from the source as the run logs embed it), or None."""
+    block = "GATE_V2_LOW" if low else "GATE_V2"
+    try:
+        text = (arm_dir / "track_1_short/stream_memory.py").read_text()
+        body = text[text.index(f"# {block}_BEGIN\n"):text.index(f"# {block}_END")]
+        specs = json.loads(ast.literal_eval(re.search(rf"{block}_JSON = (\(.*\))\s*$", body, re.S).group(1)))
+    except (OSError, ValueError, AttributeError, SyntaxError):
+        return None
+    return next((sp.get("fit") for sp in (specs if isinstance(specs, list) else [specs])
+                 if (sp.get("fit") or {}).get("total_steps") == trained), None)
+
+
+def gate_text(fit: dict | None, low: bool, trained: int) -> str:
+    block = "`GATE_V2" + ("_LOW" if low else "") + "` in `stream_memory.py`"
+    if not fit or fit.get("proxy"):
+        return (f"- **WARNING: the gate's constants** ({block}) for {trained} trained steps are "
+                + ("a placeholder fitted on a proxy model's outputs" if fit else "not in the arm's source")
+                + ": the preflight refuses this; these runs do not meet the protocol.")
+    return (f"- **The gate's constants** ({block}, the spec for {trained} trained steps) are hyperparameters, never "
+            "fitted on val: `tools/stream_retrieval/fit_gate_v2.py` fitted them on the helper's rows of the last "
+            f"{fit.get('batches', 16)} training batches of a {trained}-step dev run with `STREAM_RETRIEVAL_FIT` "
+            "(queried against the memory as it stood before them) and on that run's model outputs there. The loader is "
+            "deterministic, so those batches are these runs' own last batches; the model outputs are a dev run's of the "
+            "same code and step count, not each record run's" + (f" ({fit['note']})" if fit.get("note") else "")
+            + ". Provenance in the constants' `fit` field.")
 
 
 def retrieval_gain(runs) -> str:
@@ -306,7 +344,9 @@ def build(runs: Path, state: dict, decision: dict, arms: dict[str, Path], record
     stack_info = log_stack(first_done) if first_done else {}
     trained = steps + 72
     retrieval = family == "streamret"
-    env_var = ("STREAM_RETRIEVAL=1 " if retrieval else "") + f"NUM_SCHEDULED_ITERATIONS={steps}"
+    low = bool(state["settings"].get("streamret_low"))
+    env_var = (("STREAM_RETRIEVAL=1 " + ("STREAM_RETRIEVAL_LOW=1 " if low else "")) if retrieval else "") \
+        + f"NUM_SCHEDULED_ITERATIONS={steps}"
     if family == "mlonly":
         merged = {k: git(cand_dir, "rev-parse", ref) or "n/a" for k, ref in  # make_mlonly_arm.sh's two merges
                   (("master", "HEAD^1^1"), ("pr375", "HEAD^1^2"), ("pr379", "HEAD^2"), ("tree", "HEAD^{tree}"))}
@@ -393,7 +433,8 @@ def build(runs: Path, state: dict, decision: dict, arms: dict[str, Path], record
         cuts = ",".join(map(str, state["settings"].get("streamret_cuts") or [steps]))
         reproduce = [
             f"git clone -b {branch} {origin} modded-nanogpt && cd modded-nanogpt   # the fork: the stack and the protocol",
-            f"STREAMRET_CUTS={cuts} bash tools/record_attempt/run.sh   # the whole protocol, with the streamret arm",
+            f"{'STREAMRET_LOW=1 ' if low else ''}STREAMRET_CUTS={cuts} bash tools/record_attempt/run.sh   # the whole "
+            "protocol, with the streamret arm",
             "# the certified code: the stack plus the stream-retrieval overlay (tools/stream_retrieval/arm):",
             "ARM=$(bash tools/stream_retrieval/make_streamret_arm.sh)   # prints ../record_work/streamret",
             f'cd "$ARM" && python data/cached_fineweb10B.py 9 && {env_var} ./run.sh',
@@ -476,9 +517,11 @@ def build(runs: Path, state: dict, decision: dict, arms: dict[str, Path], record
            if retrieval else ""),
         f"2. **Mean val ≤ 3.28 at p < 0.01**: p = {cand['p']:.2g} over {cand['finished']} runs, all counted "
         f"({'PASS' if cand['p'] < 0.01 else 'FAIL'})."
-        + (" The retrieval mixture is a valid probability model: r_t sums to 1 over the vocabulary and depends on the "
-           "memory and val[<= t] only, lambda_t on (N, M, L*) only, so the mixture sums to <= 1 at every position; it is "
-           "forward-only, nothing is learned from val, and the memory is built and queried inside the timed region."
+        + (" The retrieval mixture is a valid probability model: every component sums to <= 1 over the vocabulary and "
+           "depends on the memory, val[<= t] and earlier positions' outcomes only, every gate on target-independent "
+           "features only, and stick-breaking and the softmax are convex combinations, so the mixture sums to <= 1 at "
+           "every position; it is forward-only, nothing is learned from val, and the memories are built and queried "
+           "inside the timed region."
            if retrieval else ""),
         "3. **No new compile or inductor flags**: `git diff " + heads["master"][:7] + " -- train_gpt.py track_1_short/ "
         "| grep -E '_inductor|torch.compile|dynamo.config'` adds "
@@ -521,20 +564,22 @@ def build(runs: Path, state: dict, decision: dict, arms: dict[str, Path], record
         "- **#375's normalization map** is built at import, before the clock (~45-70 ms); the record's convention puts "
         "tokenizer-derived tables on the clock, so a reviewer may ask for it to move.",
         "- **#379's validation NLL** is `-log(p + 1e-9)`, within 5e-5 nats of a normalized model (disclosed in #379).",
-        *(["- **Stream retrieval is off by default in the logged source**: every candidate leg set `STREAM_RETRIEVAL=1`. "
+        *([f"- **Stream retrieval is off by default in the logged source**: every candidate leg set "
+           f"`{env_var.rsplit(' ', 1)[0]}`. "
            "Before merging, the record settings at the top of `train_gpt.py` must also set it (with the step count), the "
            "only other difference from the logged source.",
            "- **Before the clock** the stream retrieval only compiles its C helper (`cc -O2`), spawns it and lets it "
-           "allocate and prefault its arrays (~3.7 GB of host RAM), and maps an 84 MB rows file on every rank: the same "
-           "kind of setup as the canonical mask's buffer. Everything it computes happens on the clock: insertion as "
-           "batches are fetched, the val read and the queries after the last step, the copy to the GPUs before the clock "
-           "stops. A checksum of each rank's val chunk is verified after the clock stops (a check only).",
-           "- **The gate's 4 constants** (`W` in `stream_memory.py`) are hyperparameters, never fitted on val: they were "
-           "fitted on held-out training data (training batches past a 1050-step stream, scored by a CPU proxy LM never "
-           "trained on FineWeb; provenance in the source comment). A run with `STREAM_RETRIEVAL_FIT` refits them on this "
-           "model from 64 training batches past the run's stream (`tools/stream_retrieval/fit_gate.py`).",
-           "- **The C helper** (`track_1_short/stream_memory.c`, ~600 lines with comments; C11 and pthreads, no new "
-           "dependency) is new to the repo; the run logs embed it with the Python source.",
+           "allocate and prefault its arrays (~5.3 GB of host RAM with its query arenas"
+           + (", plus ~13 GB for the low-order tables" if low else "") + ") and its rows file (in /dev/shm), "
+           "maps that file on every rank, and sizes the model's eval side-output buffers: the same kind of setup as the "
+           "canonical mask's buffer. Everything it computes happens on the clock: insertion as batches are fetched"
+           + (" (the low-order tables on 8 insertion threads, ~4 cores on average)" if low else "") + ", the val read "
+           "and the queries after the last step, the copy to the GPUs before the clock stops. A checksum of each rank's "
+           "val chunk is verified after the clock stops (a check only).",
+           gate_text(gate_fit(cand_dir, low, trained), low, trained),
+           "- **The C helper** (`track_1_short/stream_memory.c`, `stream_lowtables.c`, `stream_pointer.c`, ~3,400 lines "
+           "with comments; C11 and pthreads, no new dependency) is new to the repo; the run logs embed it with the "
+           "Python source.",
            RETRIEVAL_CONCENTRATION]
           if retrieval else []),
         notes.rstrip(),

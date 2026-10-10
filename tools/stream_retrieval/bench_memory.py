@@ -1,12 +1,14 @@
-"""Benchmark of the stream-only retrieval memory (not a test): replays the timed loader of a run's schedule through
-the tap exactly as the trainer's rank 0 does (8 ranks' spans per step, in fetch order), sends GO, and reports the
-helper's insertion cost per entry and query cost per position per thread, with the hit rates.
+"""Benchmark of the stream-only retrieval helper (not a test): replays the timed loader of a run's schedule through
+the tap exactly as the trainer's rank 0 does (8 ranks' spans per step, in fetch order), sends GO, collects rank 0's
+rows, and reports the helper's insertion cost per entry (and P2's insertion CPU and backlog), the GO->rows time and
+the query cost per position per thread (P1 + P3, + P2 with --low), the hit rates and rank 0's collect time.
 
 It needs the hooked loader, so it runs in the streamret arm (or any stack tree with apply_overlay.sh applied):
   ARM=$(bash tools/stream_retrieval/make_streamret_arm.sh)
-  python $ARM/tools/stream_retrieval/bench_memory.py DATA_DIR [--scheduled 978] [--threads N] [--features OUT.u32]
-DATA_DIR holds fineweb_train_*.bin and fineweb_val_000000.bin (real shards for meaningful hit rates).
-Targets (design): insertion <= 40 ns per entry, queries <= 400 ns per position per thread.
+  python $ARM/tools/stream_retrieval/bench_memory.py DATA_DIR [--scheduled 978] [--threads N] [--low] [--no-pointer]
+DATA_DIR holds fineweb_train_*.bin and fineweb_val_000000.bin (real shards for meaningful hit rates). The helper needs
+~10 GiB of host RAM for the whole val (the memory, its query arenas, the rows file, staging: stream_memory.host_bytes),
+--low ~15 GiB more (P2's tables, ~13 GiB, and its rows).
 """
 import argparse
 import os
@@ -39,7 +41,8 @@ def main():
     parser.add_argument("--scheduled", type=int, default=978, help="NUM_SCHEDULED_ITERATIONS")
     parser.add_argument("--world", type=int, default=8)
     parser.add_argument("--threads", type=int, default=os.cpu_count())
-    parser.add_argument("--features", default=None, help="write the val features (N, C, M, L*) as u32 [val_tokens][4]")
+    parser.add_argument("--low", action="store_true", help="with P2's exact low-order tables (STREAM_RETRIEVAL_LOW=1)")
+    parser.add_argument("--no-pointer", action="store_true", help="without P3 (STREAM_RETRIEVAL_POINTER=0)")
     parser.add_argument("--dump", default=None, help="write the memory's stream (u16, spans and 0xFFFF separators)")
     args = parser.parse_args()
     real_empty = torch.empty
@@ -57,7 +60,7 @@ def main():
         train_files=sorted(__import__("glob").glob(train)), val_file=os.path.join(args.data_dir, "fineweb_val_000000.bin"),
         total_steps=schedule.total_steps, stream_tokens=sum(b + args.world for b in sizes), world=args.world, rank=0,
         master=True, val_tokens=hp.val_tokens, chunk=hp.val_batch_size // args.world, device="cpu", threads=args.threads,
-        features_path=args.features, dump_path=args.dump,
+        low=args.low, pointer=not args.no_pointer, dump_path=args.dump,
         print0=lambda s, console=False: print(s))
     print(f"helper ready in {time.perf_counter() - t0:.1f} s (compile, allocation, prefault)")
     first = TRAINING_STAGES[0]
@@ -71,12 +74,13 @@ def main():
     t_replay = time.perf_counter() - t0
     memory.go()
     memory.collect()
-    h = [int(v) for v in memory.hdr[:stream_memory.H_FIT_POSITIONS]]
+    h = [int(v) for v in memory.hdr[:stream_memory.H_PTR_ROW_BYTES + 1]]
     ins = h[stream_memory.H_INSERT_NS] / max(h[stream_memory.H_INSERTED], 1)
     qry = h[stream_memory.H_QUERY_NS] * args.threads / max(h[stream_memory.H_QUERIED], 1)
     print(memory.stats())
-    print(f"replay of {schedule.total_steps} steps {t_replay:.1f} s; insertion {ins:.1f} ns/entry (target <= 40); "
-          f"queries {qry:.0f} ns/position/thread on {args.threads} threads (target <= 400)")
+    parts = "P1" + (" + P2" if args.low else "") + ("" if args.no_pointer else " + P3")
+    print(f"replay of {schedule.total_steps} steps {t_replay:.1f} s; insertion {ins:.1f} ns/entry; queries ({parts}) "
+          f"{qry:.0f} ns/position/thread on {args.threads} threads; rank 0's collect {memory.collect_ms:.0f} ms")
     memory.close()
 
 

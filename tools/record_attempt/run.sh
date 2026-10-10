@@ -8,8 +8,10 @@
 # RUNS (default WORK/runs; a new directory directly in WORK is a new attempt that reuses the venv, data and arms),
 # LEGS_PILOT=3, LEGS_CERT=12, LEGS_CERT_BASE=6, COLD=1, MAX_CRASHES=2, LEG_TIMEOUT=1800 (s), RECORD_NAME,
 # ALLOW_NEW_MASTER=1, ALLOW_PR_DRIFT=1 (make_mlonly_arm.sh), STREAMRET_CUTS=S1[,S2] (adds the stream-retrieval arm at
-# these scheduled steps; unset: no such arm). Tests: SETUP=0 skips the node setup; LEG_COMMAND, STACK_DIR, MASTER_DIR,
-# PR379_DIR, MAKE_MLONLY, MAKE_STREAMRET, RECORDS_DIR.
+# these scheduled steps, each with the gate's constants fitted on a FIT dev run at that step count; unset: no such arm),
+# STREAMRET_LOW=1 (that arm with the exact low-order tables, STREAM_RETRIEVAL_LOW=1: ~15 GB more host RAM, ~4-6
+# cores during training). Tests: SETUP=0 skips the node setup; LEG_COMMAND, STACK_DIR, MASTER_DIR, PR379_DIR,
+# MAKE_MLONLY, MAKE_STREAMRET, RECORDS_DIR.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")/../.." && pwd)
 TOOLS=$HERE/tools/record_attempt
@@ -17,7 +19,7 @@ DRY_RUN=0
 for arg in "$@"; do
     case $arg in
         --dry-run) DRY_RUN=1 ;;
-        -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
         *) echo "unknown argument: $arg (see --help)" >&2; exit 2 ;;
     esac
 done
@@ -33,6 +35,7 @@ STACK_DIR=${STACK_DIR:-$HERE}
 MAKE_MLONLY=${MAKE_MLONLY:-$TOOLS/make_mlonly_arm.sh}
 MAKE_STREAMRET=${MAKE_STREAMRET:-$HERE/tools/stream_retrieval/make_streamret_arm.sh}
 STREAMRET_CUTS=${STREAMRET_CUTS:-}
+STREAMRET_LOW=${STREAMRET_LOW:-0}
 PY=${PYTHON:-python3}
 
 say() { printf '%s\n' "$@"; }  # one line per argument
@@ -97,8 +100,14 @@ PLANNED=(--arm master="${MASTER_DIR:-$WORK/arms/master}" --arm pr379="${PR379_DI
 if ! grep -qs '^none:' "$RUNS/mlonly_arm.txt"; then PLANNED+=(--arm mlonly="(built by make_mlonly_arm.sh)"); fi
 # The stream-retrieval arm (attempt.py's rule 4), only with STREAMRET_CUTS: the stack plus tools/stream_retrieval's
 # overlay in its own worktree, so the stack's checkout (and a stack record's source) never carries the retrieval code.
+STREAMRET_ARGS=() PREFLIGHT_ARGS=()
+if [ -n "$STREAMRET_CUTS" ]; then PREFLIGHT_ARGS+=(--stream-helper --stream-cuts "$STREAMRET_CUTS"); fi
+if [ "$STREAMRET_LOW" = 1 ]; then
+    [ -n "$STREAMRET_CUTS" ] || die "STREAMRET_LOW=1 needs STREAMRET_CUTS (the stream-retrieval arm's step cuts)"
+    STREAMRET_ARGS=(--streamret-low) PREFLIGHT_ARGS+=(--stream-low)
+fi
 if [ -n "$STREAMRET_CUTS" ]; then
-    PLANNED+=(--arm streamret="(built by make_streamret_arm.sh)" --streamret-cuts "$STREAMRET_CUTS")
+    PLANNED+=(--arm streamret="(built by make_streamret_arm.sh)" --streamret-cuts "$STREAMRET_CUTS" "${STREAMRET_ARGS[@]}")
 fi
 "$PY" "$TOOLS/attempt.py" --dry-run "${ATTEMPT[@]}" "${PLANNED[@]}"
 
@@ -229,12 +238,12 @@ if [ "$SETUP" = 1 ]; then
 
     say "" "===== preflight: packages, GPUs, headers, Triton, NCCL, FA3 kernel, tokenizer, mask builder"
     if [ "$DRY_RUN" = 0 ]; then
-        "$PY" "$TOOLS/preflight.py" --stack "$STACK_DIR" --runs "$RUNS" ${STREAMRET_CUTS:+--stream-helper} \
+        "$PY" "$TOOLS/preflight.py" --stack "$STACK_DIR" --runs "$RUNS" "${PREFLIGHT_ARGS[@]}" \
             || die "preflight failed (above)"
         source "$RUNS/preflight.env"
         ATTEMPT+=(--environment "$RUNS/environment.txt")
     else
-        say "  would run: $PY $TOOLS/preflight.py --stack $STACK_DIR --runs $RUNS${STREAMRET_CUTS:+ --stream-helper}"
+        say "  would run: $PY $TOOLS/preflight.py --stack $STACK_DIR --runs $RUNS${PREFLIGHT_ARGS[*]:+ ${PREFLIGHT_ARGS[*]}}"
     fi
 fi
 
@@ -289,7 +298,7 @@ if [ -n "$STREAMRET_CUTS" ]; then  # asked for: a failed build stops here, befor
         STREAMRET_DIR=$(bash "$MAKE_STREAMRET" "$WORK" 2> >(sed 's/^/  /' >&2) | tail -n 1) \
             || die "make_streamret_arm.sh failed (above); unset STREAMRET_CUTS to attempt without the streamret arm"
         [ -f "$STREAMRET_DIR/train_gpt.py" ] || die "make_streamret_arm.sh printed '$STREAMRET_DIR', which holds no train_gpt.py"
-        ARMS+=(--arm streamret="$STREAMRET_DIR" --streamret-cuts "$STREAMRET_CUTS")
+        ARMS+=(--arm streamret="$STREAMRET_DIR" --streamret-cuts "$STREAMRET_CUTS" "${STREAMRET_ARGS[@]}")
     fi
 fi
 if [ -n "$MLONLY_DIR" ] && [ "${MLONLY_DIR#none: }" = "$MLONLY_DIR" ]; then

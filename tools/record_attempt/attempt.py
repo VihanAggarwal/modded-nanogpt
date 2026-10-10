@@ -33,8 +33,10 @@ STEP_OPTIONS = (978, 963)            # scheduled steps; +72 growth and extension
 GROWTH_STEPS = 72
 GATE_963 = 3.2765                    # >= 3.5 millinats under 3.28
 # The stack plus stream-only retrieval (tools/stream_retrieval/make_streamret_arm.sh builds that arm), run with
-# STREAM_RETRIEVAL=1. Its gain only pays as a step cut, so it has no default cuts: they come from a measured gain
-# (one STREAM_RETRIEVAL=1 dev run's `gain:` line, tools/stream_retrieval/README.md) and are passed as --streamret-cuts.
+# STREAM_RETRIEVAL=1 (and with --streamret-low also STREAM_RETRIEVAL_LOW=1: the exact low-order tables, ~14 GB of
+# host RAM and ~4 cores during training). Its gain only pays as a step cut, so it has no default cuts: they come from a
+# measured gain (a dev run's `gain:` line with the same parts, tools/stream_retrieval/README.md) and are passed as
+# --streamret-cuts.
 RETRIEVAL = "streamret"
 MIN_PER_LEG, MIN_PER_COMPILE, MIN_SETUP = (2, 3), 7, 15   # per warm leg: a range, never measured for this trainer
 STOPPED = 3                          # ab_bench's exit code after --max-crashes
@@ -48,10 +50,14 @@ def parse_cuts(text: str | None) -> tuple[int, ...]:
     return cuts
 
 
-def rule_text(legs_pilot: int, legs_cert: int, legs_cert_base: int, cuts: tuple[int, ...] = ()) -> str:
+def retrieval_env(low: bool) -> str:
+    return "STREAM_RETRIEVAL=1" + (" STREAM_RETRIEVAL_LOW=1" if low else "")
+
+
+def rule_text(legs_pilot: int, legs_cert: int, legs_cert_base: int, cuts: tuple[int, ...] = (), low: bool = False) -> str:
     retrieval = bool(cuts)
     step4 = f"""\
-4. Stream retrieval: streamret (the stack plus stream retrieval, STREAM_RETRIEVAL=1) runs {legs_pilot} pilot legs at
+4. Stream retrieval: streamret (the stack plus stream retrieval, {retrieval_env(low)}) runs {legs_pilot} pilot legs at
    each of {" and ".join(map(str, cuts))} scheduled steps (cuts set from a dev run's measured gain). Its step count is
    the lowest of these whose {legs_pilot} legs all finished with a mean final val <= {GATE_963}; if none, it is not
    eligible. It replaces the candidate of rules 2-3 only if all its pilot legs finished and its pilot train time at
@@ -193,11 +199,16 @@ class Attempt:
         self.retrieval = RETRIEVAL in self.arms
         if self.retrieval != bool(self.cuts):
             raise SystemExit("the streamret arm and --streamret-cuts go together (STREAMRET_CUTS in run.sh)")
+        self.low = bool(args.streamret_low)
+        if self.low and not self.retrieval:
+            raise SystemExit("--streamret-low needs the streamret arm (STREAMRET_LOW=1 needs STREAMRET_CUTS in run.sh)")
         self.settings = dict(legs_pilot=args.legs_pilot, legs_cert=args.legs_cert, legs_cert_base=args.legs_cert_base,
                              cold=args.cold, command=args.command, max_crashes=args.max_crashes, data=args.data)
         if self.cuts:
             self.settings["streamret_cuts"] = list(self.cuts)
-        self.rule = rule_text(args.legs_pilot, args.legs_cert, args.legs_cert_base, self.cuts)
+        if self.low:  # only when set: an attempt started without it keeps its settings
+            self.settings["streamret_low"] = True
+        self.rule = rule_text(args.legs_pilot, args.legs_cert, args.legs_cert_base, self.cuts, self.low)
 
     # ------------------------------------------------------------------ plan
 
@@ -226,8 +237,8 @@ class Attempt:
         if "mlonly" not in self.arms:
             lines.append("  (no mlonly arm: the fallback candidate is unavailable)")
         if self.retrieval:
-            lines.append(f"  streamret = the stack plus stream retrieval (make_streamret_arm.sh), STREAM_RETRIEVAL=1, pilot "
-                         f"at {' and '.join(map(str, self.cuts))} scheduled steps (rule 4)")
+            lines.append(f"  streamret = the stack plus stream retrieval (make_streamret_arm.sh), {retrieval_env(self.low)}, "
+                         f"pilot at {' and '.join(map(str, self.cuts))} scheduled steps (rule 4)")
         return "\n".join(lines) + "\n\n" + self.rule
 
     # ------------------------------------------------------------------ state
@@ -280,7 +291,7 @@ class Attempt:
             if family in FAMILIES + (RETRIEVAL,):  # explicit step count, whatever the arm's default
                 cmd += ["--arm-env", f"{name}:NUM_SCHEDULED_ITERATIONS={name[len(family):] or STEP_OPTIONS[0]}"]
             if family == RETRIEVAL:
-                cmd += ["--arm-env", f"{name}:STREAM_RETRIEVAL=1"]
+                cmd += [arg for kv in retrieval_env(self.low).split() for arg in ("--arm-env", f"{name}:{kv}")]
         cmd += [arg for name in droppable for arg in ("--droppable", name)]
         if s["data"]:
             cmd += ["--data-path", s["data"]]
@@ -401,6 +412,8 @@ def main():
                         help="master, pr379, stack and (optionally) mlonly checkouts, and streamret (with --streamret-cuts)")
     parser.add_argument("--streamret-cuts", default=None, metavar="S1,S2",
                         help="the streamret arm's scheduled step counts (from a dev run's measured gain)")
+    parser.add_argument("--streamret-low", action="store_true",
+                        help="the streamret arm with the exact low-order tables (STREAM_RETRIEVAL_LOW=1)")
     parser.add_argument("--data", default=None, help="DATA_PATH of every leg")
     parser.add_argument("--legs-pilot", type=int, default=3)
     parser.add_argument("--legs-cert", type=int, default=12, help="certification legs of the candidate")

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # The record attempt's streamret arm: this branch's stack (HEAD) with stream-only retrieval on top
-# (apply_overlay.sh: track_1_short/stream_memory.{c,py} and the trainer hooks in arm/hooks.patch), committed as one
-# commit with a fixed identity and date, so the same HEAD gives the same arm commit on every node. The stack's own
-# checkout never carries the retrieval code, so a stack record's source is only the stack. Run from a checkout:
+# (apply_overlay.sh: track_1_short/stream_{memory,lowtables,pointer}.{c,py} and the trainer hooks in arm/hooks.patch),
+# committed as one commit with a fixed identity and date, so the same HEAD gives the same arm commit on every node. The
+# stack's own checkout never carries the retrieval code, so a stack record's source is only the stack. Run from a checkout:
 #   ARM=$(bash tools/stream_retrieval/make_streamret_arm.sh [WORK])    # WORK defaults to ../record_work
 # Prints the arm's directory ($WORK/streamret) on stdout, progress on stderr. Idempotent: an arm already built from
 # this HEAD and overlay is reused; otherwise it is rebuilt in place (untracked files such as logs/ are kept).
@@ -21,7 +21,8 @@ dirty=$(git -C "$HERE" status --porcelain --untracked-files=all -- train_gpt.py 
 [ -z "$dirty" ] || die "uncommitted changes to the stack or the overlay (commit them first):
 $dirty"
 OVERLAY=$(cd "$HERE/tools/stream_retrieval" && cat arm/hooks.patch arm/track_1_short/stream_memory.c \
-          arm/track_1_short/stream_memory.py apply_overlay.sh | sha256sum | cut -c1-16)
+          arm/track_1_short/stream_memory.py arm/track_1_short/stream_lowtables.c arm/track_1_short/stream_lowtables.py \
+          arm/track_1_short/stream_pointer.c arm/track_1_short/stream_pointer.py apply_overlay.sh | sha256sum | cut -c1-16)
 MESSAGE="Stream-only retrieval on top of ${BASE:0:12} (overlay $OVERLAY)"
 
 git -C "$HERE" worktree prune
@@ -33,7 +34,9 @@ else
         [ -e "$ARM/.git" ] || die "$ARM exists and is not a git worktree: move it away"
         git -C "$ARM" diff --quiet HEAD || die "$ARM has modified tracked files: discard them (git -C $ARM checkout -- .) and rerun"
         git -C "$ARM" checkout -q --detach "$BASE"
-        rm -f "$ARM/track_1_short/stream_memory.c" "$ARM/track_1_short/stream_memory.py"  # untracked at BASE
+        for part in stream_memory stream_lowtables stream_pointer; do  # untracked at BASE
+            rm -f "$ARM/track_1_short/$part.c" "$ARM/track_1_short/$part.py"
+        done
     else
         git -C "$HERE" worktree add -q --detach "$ARM" "$BASE"
     fi

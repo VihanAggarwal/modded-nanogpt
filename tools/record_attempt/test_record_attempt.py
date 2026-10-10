@@ -30,6 +30,13 @@ import record_stats  # noqa: E402
 
 CPLM = REPO / "records/track_1_short/2026-10_CPLM"
 
+# The streamret arm's constants blocks as fit_gate_v2.py --module writes them: one spec per FIT dev run's step count
+# (the cuts 860 and 900 trained 932 and 972 steps), only their provenance here.
+_SPECS = [{"fit": {"total_steps": t, "batches": 16, "note": f"G3 dev run at {t - 72}"}} for t in (972, 932)]
+FAKE_OVERLAY = "# fake overlay\n" + "".join(
+    f"# {block}_BEGIN\n{block}_JSON = (\n    {json.dumps(json.dumps(_SPECS))}\n)\n# {block}_END\n"
+    for block in ("GATE_V2", "GATE_V2_LOW"))
+
 FAKE_TRAINER = r'''
 import json, os, random, sys, time, uuid
 cfg = json.load(open("fake.json"))
@@ -64,6 +71,8 @@ with open(path, "w") as f:
     wall = steps * cfg["ms_per_step"] + rng.gauss(0, 30)
     val = cfg["val978"] + cfg.get("val_per_step", 0) * (978 - sched) + rng.gauss(0, cfg.get("val_sd", 0.0008))
     gain = cfg.get("sr_gain", 0.0) if os.environ.get("STREAM_RETRIEVAL") == "1" else None
+    if gain is not None and os.environ.get("STREAM_RETRIEVAL_LOW") == "1":  # the low-order tables' extra gain
+        gain += cfg.get("sr_low_gain", 0.0)
     f.write(f"step:{steps}/{steps} val_loss:{val - (gain or 0):.4f} train_time:{wall:.0f}ms step_avg:{wall / steps:.2f}ms\n")
     if gain is not None:
         f.write(f"step:{steps} stream_retrieval val_loss_lm:{val:.5f} val_loss_mixed:{val - gain:.5f} gain:{1000 * gain:.2f}mnat\n")
@@ -95,7 +104,7 @@ def make_node(tmp_path: Path, **overrides) -> dict:
         (dirs[name] / "fake.json").write_text(json.dumps(cfg))
     streamret = tmp_path / "arms" / "streamret"  # the stack plus the overlay: the stack's numbers
     shutil.copytree(dirs["stack"], streamret)
-    (streamret / "track_1_short/stream_memory.py").write_text("# fake overlay\n")
+    (streamret / "track_1_short/stream_memory.py").write_text(FAKE_OVERLAY)
     (streamret / "fake.json").write_text(json.dumps(dict(json.loads((dirs["stack"] / "fake.json").read_text()),
                                                          name="streamret")))
     dirs["streamret"] = streamret
@@ -253,6 +262,15 @@ def test_dry_run_prints_the_plan_and_touches_nothing(tmp_path):
     assert "46 legs" in with_cuts.stdout and "B pilot:   21 legs" in with_cuts.stdout
     assert "streamret900" in with_cuts.stdout and "4. Stream retrieval" in with_cuts.stdout
     assert "would build the streamret arm" in with_cuts.stdout and not node["work"].exists()
+    assert "STREAM_RETRIEVAL_LOW" not in with_cuts.stdout
+    node["env"]["STREAMRET_LOW"] = "1"
+    with_low = run_sh(node, "--dry-run")
+    assert with_low.returncode == 0, with_low.stderr
+    assert "streamret = the stack plus stream retrieval (make_streamret_arm.sh), STREAM_RETRIEVAL=1 STREAM_RETRIEVAL_LOW=1" \
+        in with_low.stdout and "(the stack plus stream retrieval, STREAM_RETRIEVAL=1 STREAM_RETRIEVAL_LOW=1)" in with_low.stdout
+    del node["env"]["STREAMRET_CUTS"]
+    alone = run_sh(node, "--dry-run")
+    assert alone.returncode == 1 and "STREAMRET_LOW=1 needs STREAMRET_CUTS" in alone.stderr
 
 
 def test_end_to_end_stack_at_963(tmp_path):
@@ -483,11 +501,30 @@ def test_end_to_end_stream_retrieval_wins_with_its_cut(tmp_path):
                  "STREAM_RETRIEVAL=1 NUM_SCHEDULED_ITERATIONS=860 ./run.sh", "in-run gain", "30.00 millinats",
                  "Stream retrieval with its step cut (pilot only, not pooled: streamret860 vs stack963)",
                  "off by default in the logged source", "valid probability model", "860 scheduled steps (932 trained)",
-                 "must become 860", "READY FOR A PR: yes"):
+                 "must become 860", "READY FOR A PR: yes",
+                 "(`GATE_V2` in `stream_memory.py`, the spec for 932 trained steps)",
+                 "last 16 training batches of a 932-step dev run", "these runs' own last batches", "G3 dev run at 860"):
         assert text in readme, text
+    assert "WARNING: the gate's constants" not in readme
     verdict = (node["runs"] / "verdict.txt").read_text()
     assert "stream retrieval, with the 860-step cut): YES" in verdict and "streamret arm" in verdict
     assert "make_streamret_arm.sh" in verdict and str(node["dirs"]["streamret"]) in verdict
+
+
+def test_end_to_end_stream_retrieval_with_the_low_orders(tmp_path):
+    # Worth 2 millinats alone and 30 with STREAM_RETRIEVAL_LOW=1: only STREAMRET_LOW=1's arm env makes the cut pay.
+    node = make_node(tmp_path, stack=dict(sr_gain=0.002, sr_low_gain=0.028))
+    node["env"].update(STREAMRET_CUTS="900,860", STREAMRET_LOW="1")
+    result = run_sh(node)
+    assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-3000:]
+    state = json.loads((node["runs"] / "attempt.json").read_text())
+    assert state["settings"]["streamret_low"] is True and "STREAM_RETRIEVAL_LOW=1" in state["rule"]
+    decision = json.loads((node["runs"] / "decision.json").read_text())
+    assert (decision["candidate"], decision["steps"]) == ("streamret", 860)
+    readme = (record_folder(node) / "README.md").read_text()
+    for text in ("STREAM_RETRIEVAL=1 STREAM_RETRIEVAL_LOW=1 NUM_SCHEDULED_ITERATIONS=860 ./run.sh", "30.00 millinats",
+                 "STREAMRET_LOW=1 STREAMRET_CUTS=860,900", "GATE_V2_LOW", "low-order tables"):
+        assert text in readme, text
 
 
 def test_runs_outside_work_is_refused(tmp_path):
@@ -513,6 +550,35 @@ def test_preflight_checks_that_run_on_cpu(tmp_path, capsys):
         preflight.check_toolchain()
         preflight.check_stream_helper(REPO)  # the streamret arm's C helper
         assert "stream-retrieval helper builds" in capsys.readouterr().out
+        # A record's cuts need constants fitted on our model at their own step count: the shipped CPU placeholders
+        # (a proxy's outputs, at 1050 steps) are refused, at a cut and at the full 978 alike.
+        for cuts, why in (((900,), "no constants fitted at 972 trained steps"), ((978,), "placeholder fitted on a proxy")):
+            with pytest.raises(SystemExit):
+                preflight.check_stream_helper(REPO, cuts=cuts)
+            out = capsys.readouterr().out
+            assert why in out and f"NUM_SCHEDULED_ITERATIONS={cuts[0]} STREAM_RETRIEVAL=1" in out, out
+        # ... and accepted once a FIT dev run's fit at the cut is in (fit_gate_v2.py --module on a copy of the overlay)
+        stack = tmp_path / "stack"
+        shutil.copytree(REPO / "tools/stream_retrieval/arm", stack / "tools/stream_retrieval/arm",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        sys.path.insert(0, str(REPO / "tools/stream_retrieval"))
+        import fit_gate_v2
+        module = stack / "tools/stream_retrieval/arm/track_1_short/stream_memory.py"
+        spec = fit_gate_v2.read_module(module, "GATE_V2")[0]
+        fit = {k: v for k, v in spec["fit"].items() if k != "proxy"}
+        fit_gate_v2.write_module(dict(spec, fit=dict(fit, total_steps=972, note="G3 dev run")), module)
+        preflight.check_stream_helper(stack, cuts=(900,))
+        assert "cut 900: the gate's constants were fitted at 972 trained steps" in capsys.readouterr().out
+        with pytest.raises(SystemExit):  # GATE_V2_LOW still holds only the placeholder
+            preflight.check_stream_helper(stack, low=True, cuts=(900,))
+        capsys.readouterr()
+    # The host's RAM: the retrieval's footprint (with P2's tables) and the trainers' allowance
+    assert preflight.TRAINED_OVER_SCHEDULED == attempt.GROWTH_STEPS
+    with pytest.raises(SystemExit):
+        preflight.check_stream_ram(REPO, low=True, avail=40.0)
+    assert "low tables 13.2" in capsys.readouterr().out
+    preflight.check_stream_ram(REPO, low=False, avail=60.0)
+    assert "the stream retrieval needs ~10 GiB" in capsys.readouterr().out
     # The stack's canonical-mask builder starts with `python -P` (3.11+) and needs tiktoken's GPT-2 files.
     try:
         import tiktoken

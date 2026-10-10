@@ -1,9 +1,9 @@
 """The stream-retrieval overlay (tools/stream_retrieval): the stack carries none of its code, the overlay applies to
 the stack, its own tests pass inside the resulting tree, and make_streamret_arm.sh builds and reuses the arm.
 
-The retrieval's tests (tools/stream_retrieval/test_stream_retrieval.py) import track_1_short.stream_memory and the
-hooked data.py, which exist only in the arm, so they run in a subprocess inside a copy of this working tree with the
-overlay applied; their output is printed (pytest -s shows it).
+The retrieval's tests (tools/stream_retrieval/test_*.py: test_stream_retrieval.py imports track_1_short.stream_memory
+and the hooked data.py / model/gpt.py, which exist only in the arm; the others load the overlay by path) run in a
+subprocess inside a copy of this working tree with the overlay applied; their output is printed (pytest -s shows it).
 """
 import os
 import re
@@ -16,7 +16,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 OVERLAY = ROOT / "tools/stream_retrieval"
-RETRIEVAL_WORDS = re.compile(r"stream_memory|STREAM_RETRIEVAL|on_spans|stream_rows")
+RETRIEVAL_WORDS = re.compile(r"stream_memory|stream_lowtables|stream_pointer|STREAM_RETRIEVAL|on_spans|stream_rows|stream_lm")
+PARTS = ("stream_memory", "stream_lowtables", "stream_pointer")
 
 
 def stack_tree(dst: Path) -> Path:
@@ -41,7 +42,7 @@ def test_the_stack_carries_no_retrieval_code():
     hits = [f"{p.relative_to(ROOT)}:{i + 1}" for p in files for i, line in enumerate(p.read_text().splitlines())
             if RETRIEVAL_WORDS.search(line)]
     assert not hits, hits
-    assert not list((ROOT / "track_1_short").glob("stream_memory*"))
+    assert not [p for part in PARTS for p in (ROOT / "track_1_short").glob(f"{part}*")]
 
 
 def test_the_overlay_applies_once_and_only_adds_the_retrieval(tmp_path):
@@ -49,20 +50,20 @@ def test_the_overlay_applies_once_and_only_adds_the_retrieval(tmp_path):
     before = {p: p.read_text() for p in [tree / "train_gpt.py", *(tree / "track_1_short").rglob("*.py")]}
     done = overlay(tree)
     assert done.returncode == 0, done.stderr
-    assert (tree / "track_1_short/stream_memory.c").exists() and (tree / "track_1_short/stream_memory.py").exists()
+    assert all((tree / f"track_1_short/{part}.{ext}").exists() for part in PARTS for ext in ("c", "py"))
     changed = sorted(str(p.relative_to(tree)) for p, text in before.items() if p.read_text() != text)
-    assert changed == ["track_1_short/data.py", "track_1_short/run_log.py", "train_gpt.py"]
+    assert changed == ["track_1_short/data.py", "track_1_short/model/gpt.py", "track_1_short/run_log.py", "train_gpt.py"]
     again = overlay(tree)
     assert again.returncode != 0 and "already has the stream-retrieval code" in again.stderr
 
 
 def test_the_retrieval_tests_pass_in_the_arm(tmp_path):
+    """Every test file of the overlay (the arm's, and the standalone ones of the helper, its parts and the gate)."""
     tree = stack_tree(tmp_path / "arm")
     assert overlay(tree).returncode == 0
-    env = {k: v for k, v in os.environ.items() if k != "STREAM_RETRIEVAL"}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("STREAM_RETRIEVAL")}
     result = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-rs",
-                             "tools/stream_retrieval/test_stream_retrieval.py"], cwd=tree, env=env, capture_output=True,
-                            text=True, timeout=1800)
+                             "tools/stream_retrieval"], cwd=tree, env=env, capture_output=True, text=True, timeout=3600)
     print(result.stdout[-4000:])
     assert result.returncode == 0, result.stdout[-6000:] + result.stderr[-3000:]
     assert " passed" in result.stdout and " failed" not in result.stdout
@@ -86,9 +87,12 @@ def test_make_streamret_arm_builds_reuses_and_rebuilds(tmp_path):
     arm = Path(first.stdout.strip().splitlines()[-1])
     assert arm == tmp_path / "work/streamret"
     assert git("rev-parse", "HEAD^", cwd=arm) == git("rev-parse", "HEAD")
-    assert (arm / "track_1_short/stream_memory.c").exists() and "on_spans" in (arm / "track_1_short/data.py").read_text()
+    assert all((arm / f"track_1_short/{part}.c").exists() for part in PARTS)
+    assert "on_spans" in (arm / "track_1_short/data.py").read_text()
+    assert "stream_lm_out" in (arm / "track_1_short/model/gpt.py").read_text()
     assert git("status", "--porcelain", "--untracked-files=no", cwd=arm) == ""
-    assert not list((repo / "track_1_short").glob("stream_memory*")) and git("status", "--porcelain") == ""
+    assert not [p for part in PARTS for p in (repo / "track_1_short").glob(f"{part}*")]
+    assert git("status", "--porcelain") == ""
     arm_head = git("rev-parse", "HEAD", cwd=arm)
     (arm / "logs").mkdir()
     (arm / "logs/leg.txt").write_text("kept")

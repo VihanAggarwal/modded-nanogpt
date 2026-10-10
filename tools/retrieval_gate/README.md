@@ -40,9 +40,9 @@ built by a C helper on the clock.
 So this gate is no longer on the critical path. It measures how much of #367's feature model survives a stream-only
 memory, which says how far a stream-only memory is from #367/#380's claims. Whether `STREAM_RETRIEVAL` pays is
 measured directly: every run with the flag logs `val_loss_lm` (the same weights without the mixture) next to
-`val_loss`, so one 1050-step dev run gives the gain on our model, paired (design section 10, G1). The CPU proxies
-bracket it at 15-32 millinats (~2-4 s); `tools/record_attempt` pilots it only with `STREAMRET_CUTS`, cuts chosen from
-that measured gain (its rule 4). The gate's `stream` index (a SlotIndex over the segments rank 0 records) and
+`val_loss`, so a 1050-step dev run gives the gain on our model, paired (`tools/stream_retrieval/README.md`, G1 / G2).
+On the llm.c CPU proxy v2 gives ~25 millinats (P1 + P3) and ~35 with the exact low-order tables (P2); `tools/record_attempt`
+pilots it only with `STREAMRET_CUTS`, cuts chosen from that measured gain (its rule 4). The gate's `stream` index (a SlotIndex over the segments rank 0 records) and
 `STREAM_RETRIEVAL`'s memory hold the same tokens: every rank's trained spans of every timed step.
 
 ## Ask the maintainers first
@@ -58,8 +58,12 @@ discussion thread or #367:
 > For our implementation specifically: (1) the memory is filled from the loader's own document spans as
 > batches are fetched, and queried for all val positions before the clock stops; (2) a helper process is
 > spawned and allocates its arrays before t0 (no data touched), or we can move the spawn to t0; (3) the
-> helper is ~600 lines of C (C11, pthreads); (4) the mixture's 4 gate constants are tuned on training
-> batches past the run's stream (never on val). Are these acceptable?
+> helper is ~3,400 lines of C (C11, pthreads), and an optional part of it (exact counts of orders 1-5, #380's
+> recipe) needs ~13 GiB of host RAM for its tables and ~4-6 cores during training; (4) the mixture's ~1k gate
+> constants are fitted in dev runs at the record's step count on the run's own last 16 training batches
+> (queried against the memory as it stood before them; the loader is deterministic, so they are the record
+> runs' own last batches too; the model outputs they are fitted on are the dev run's; never on val). Are these
+> acceptable?
 >
 > One fact to weigh: on CPU proxies the gain is concentrated in val documents that share long verbatim
 > passages with documents the run trained on, mostly web boilerplate. The top 1% of val documents carry

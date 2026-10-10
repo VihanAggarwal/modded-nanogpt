@@ -38,6 +38,59 @@ index 8a77d94..b2423b1 100644
  
              buf = torch.cat([tokens[i:j] for i, j in zip(start_idxs, end_idxs)])
              _inputs = buf[:-1]
+diff --git a/track_1_short/model/gpt.py b/track_1_short/model/gpt.py
+index b0ae223..d7f1dbd 100644
+--- a/track_1_short/model/gpt.py
++++ b/track_1_short/model/gpt.py
+@@ -27,6 +27,7 @@ from track_1_short.perf.kernels.sampled_cross_entropy import SampledSoftcappedCr
+ from track_1_short.perf.kernels.value_embed import value_embed_lookup
+ from track_1_short.perf.residual_fusion import rms_norm_with_head, scale, scale_add
+ from track_1_short.sampled_softmax import SampledLoss
++from track_1_short import stream_memory
+ from track_1_short.token_norm import NORM_MAP
+ 
+ # Layer topology (11 layers). Depth cut from record #360 (ANVIL2): layer 7 is removed whole -- its
+@@ -235,6 +236,11 @@ class GPT(nn.Module):
+         self.init_mudd(num_layers, model_dim)
+         self.init_mudd_gate(model_dim)
+ 
++        # STREAM_RETRIEVAL (track_1_short/stream_memory.py): the eval forward's side output for the retrieval's gate.
++        # train_gpt.py sets both (query tokens [rows, K], features [rows, 2 + 3K]) only under the flag.
++        self.register_buffer("stream_lm_tok", None, persistent=False)
++        self.register_buffer("stream_lm_out", None, persistent=False)
++
+         # CPLM (env CPLM=1): copy-sink pointer, K=1 head of dim CPLM_DIM over the final hidden state, plus a
+         # learned sink key. <copy> is the first padding row of the vocab, so lm_head needs no new rows.
+         self.cplm = os.environ.get("CPLM") == "1"
+@@ -912,10 +918,19 @@ class GPT(nn.Module):
+                 # the 0..23 the softcap leaves, so a dropped token contributes nothing to the softmax.
+                 dropped = (self.canon_mask[input_seq[lo:hi], :, None] >> shifts & 1).view(logits.shape).bool()
+                 logits = logits.masked_fill(dropped, -60.0)
++                if self.stream_lm_out is not None:  # STREAM_RETRIEVAL: the LM's features for the gate (untimed eval)
++                    self._stream_lm(logits, lo, hi, None)
+                 slab_losses.append(F.cross_entropy(logits, target_seq[lo:hi], reduction="none"))
+             loss_per_token = torch.cat(slab_losses)
+         return loss_per_token
+ 
++    def _stream_lm(self, logits, lo, hi, drop_col):
++        """STREAM_RETRIEVAL (untimed eval): stream_memory.lm_features of rows lo..hi into stream_lm_out, in sub-slabs
++        of stream_memory.LM_ROWS rows, so that its [rows, vocab] temporaries stay small."""
++        for a in range(lo, hi, stream_memory.LM_ROWS):
++            b = min(a + stream_memory.LM_ROWS, hi)
++            self.stream_lm_out[a:b].copy_(stream_memory.lm_features(logits[a - lo:b - lo], self.stream_lm_tok[a:b], drop_col))
++
+     def _cplm_loss(self, x, input_seq, target_seq, mtp_weights, prefix_weight, sampled_loss, seqlens, ws_long=None):
+         """_loss with the next-token CE replaced by the copy-sink mixture (training: inside the fused CE kernel;
+         validation: on the canonical-masked full-softmax logits, <copy> exempt from the mask)."""
+@@ -995,6 +1010,8 @@ class GPT(nn.Module):
+             if not COPY_EXT_GATE:
+                 dropped[:, COPY_TOKEN_ID] = False  # the <copy> gate is not a token: never masked
+             logits = logits.masked_fill(dropped, -60.0)
++            if self.stream_lm_out is not None:  # STREAM_RETRIEVAL: the LM's features for the gate (<copy> is no token)
++                self._stream_lm(logits, lo, hi, self.copy_col_full)
+             # Copy mass on tokens the mask rules out is simply lost (the mixture then sums to <= 1 over the
+             # feasible tokens), so the mask never overstates the copy branch.
+             lse = logits.logsumexp(-1)
 diff --git a/track_1_short/run_log.py b/track_1_short/run_log.py
 index 0750a5e..062b79e 100644
 --- a/track_1_short/run_log.py
@@ -57,7 +110,7 @@ index 0750a5e..062b79e 100644
      chunks = []
      for path in files:
 diff --git a/train_gpt.py b/train_gpt.py
-index 39705f9..6f985b6 100644
+index 39705f9..368959d 100644
 --- a/train_gpt.py
 +++ b/train_gpt.py
 @@ -66,6 +66,7 @@ from track_1_short.perf.row_prefetch import PrefetchStaging, RowPrefetch
@@ -80,15 +133,32 @@ index 39705f9..6f985b6 100644
          )
  
      def val_loader():
-@@ -353,7 +355,19 @@ def main():
+@@ -257,6 +259,16 @@ def main():
+     )
+     print0(f"sampled softmax: P by step change {[(s, sampled_softmax.counts[s]) for s in [0, *sampled_softmax.count_change_steps()]]}")
+ 
++    # STREAM_RETRIEVAL=1 (track_1_short/stream_memory.py): the gate's constants (those fitted at this run's step count),
++    # checked against the run's parts (STREAM_RETRIEVAL_LOW, STREAM_RETRIEVAL_POINTER) before anything is built, and
++    # the eval forward's side-output buffers for the gate's LM features (query tokens in, features out; untimed eval).
++    stream_gate = None
++    if stream_memory.ENABLED:
++        stream_gate = stream_memory.Gate.for_run(steps=training_schedule.total_steps)
++        print0(stream_gate.describe(), console=True)
++        model.stream_lm_tok = torch.zeros(val_tokens_per_rank, stream_gate.tokens(), dtype=torch.long, device=env.device)
++        model.stream_lm_out = torch.zeros(val_tokens_per_rank, 2 + 3 * stream_gate.tokens(), device=env.device)
++
+     uncompiled_model = model  # the CUDA-graph owners read and set attributes on the module itself
+     model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
+     # The ANVIL bank updates run through their CUDA graphs once captured (eagerly before).
+@@ -353,7 +365,19 @@ def main():
      ########################################
      #        Training and validation       #
      ########################################
 -    batches = ScheduledBatches(train_loader(), training_schedule, steps=range(training_schedule.total_steps))
-+    # STREAM_RETRIEVAL=1 (track_1_short/stream_memory.py): a memory of exactly the tokens this run trains on, mixed
-+    # into the final validation. Here only the helper's compile, allocation and spawn; rank 0's timed loader feeds it
-+    # every fetched step's spans on the clock (the warmup loader above never did), and it queries val before the
-+    # clock stops.
++    # STREAM_RETRIEVAL=1 (track_1_short/stream_memory.py): memories of exactly the tokens this run trains on, mixed
++    # into the final validation. Here only the helper's compile, allocation and spawn (with STREAM_RETRIEVAL_LOW=1 also
++    # its low-order tables); rank 0's timed loader feeds it every fetched step's spans on the clock (the warmup loader
++    # above never did), and it queries val before the clock stops.
 +    memory = None
 +    if stream_memory.ENABLED:
 +        memory = stream_memory.StreamMemory.for_run(
@@ -101,15 +171,7 @@ index 39705f9..6f985b6 100644
      row_prefetch = RowPrefetch(ngram_table, value_embed_pull, batches, range(training_schedule.total_steps),
                                 is_update_step, prefetch_staging)
  
-@@ -405,13 +419,15 @@ def main():
-         training_manager.advance_schedule(step)
-         # --------------- VALIDATION SECTION -----------------
-         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
--            if last_step:
-+            if last_step and not (memory is not None and memory.fit_path):  # STREAM_RETRIEVAL_FIT reads on
-                 # Training is over: release its loader, so the two shards it holds go back to PyTorch's
-                 # pinned-memory cache, where the val shard's read finds a buffer instead of paying a
-                 # fresh 256 MB cudaHostAlloc on the clock.
+@@ -412,6 +436,8 @@ def main():
                  batches.close()
              # The val reads start now, on the loader thread; collected below, before the n-gram pulls.
              val_batches = loader_thread.submit(read_val_batches)
@@ -118,7 +180,7 @@ index 39705f9..6f985b6 100644
              # The deferred gathers land first: validation reads the banks and, at the last step, ships
              # into them.
              if last_step:
-@@ -439,18 +455,27 @@ def main():
+@@ -439,18 +465,30 @@ def main():
              val_pulls = ngram_table.eval_pulls([batch.ngram_ids for batch in val_batches])
              for pull in val_pulls:
                  ngram_table.land(pull)
@@ -131,6 +193,7 @@ index 39705f9..6f985b6 100644
              val_loss = 0
 +            if stream_rows is not None:
 +                memory.check(val_batches)  # the rows are this rank's val chunks
++                stream_eval = stream_memory.StreamEval(stream_rows, stream_gate)
 +                val_loss_lm = 0  # the same weights without the mixture: the gain, paired
              if getattr(model, "cplm", False):
                  model.cplm_diag.zero_()
@@ -140,16 +203,18 @@ index 39705f9..6f985b6 100644
                      ngram_table.land(pull)
 -                    val_loss += model(batch.inputs, batch.targets, batch.cum_seqlens, ngram_table.slots(pull, batch.ngram_ids),
 -                                      training_manager.get_forward_args()).mean()
-+                    nll = model(batch.inputs, batch.targets, batch.cum_seqlens, ngram_table.slots(pull, batch.ngram_ids),
-+                                training_manager.get_forward_args())
-+                    if stream_rows is not None:
++                    forward = lambda: model(batch.inputs, batch.targets, batch.cum_seqlens,
++                                            ngram_table.slots(pull, batch.ngram_ids), training_manager.get_forward_args())
++                    if stream_rows is None:
++                        val_loss += forward().mean()
++                    else:  # the forward reports the LM's features at the gate's query tokens; then the mixture
++                        nll, mixed = stream_eval.evaluate(s, batch, forward, uncompiled_model)
 +                        val_loss_lm += nll.mean()
-+                        nll = stream_memory.mix(nll, stream_rows[s])
-+                    val_loss += nll.mean()
++                        val_loss += mixed.mean()
              val_loss /= val_steps
              if last_step and getattr(model, "cplm", False) and os.environ.get("CPLM_EVAL_BLOCKS"):
                  # Diagnostic: re-evaluate the same final model with wider copy bands (validation only; the
-@@ -460,10 +485,11 @@ def main():
+@@ -460,10 +498,12 @@ def main():
                      uncompiled_model.copy_eval_block = blk
                      vl = 0
                      with torch.no_grad():
@@ -158,13 +223,14 @@ index 39705f9..6f985b6 100644
                              ngram_table.land(pull)
 -                            vl += model(batch.inputs, batch.targets, batch.cum_seqlens, ngram_table.slots(pull, batch.ngram_ids),
 -                                        training_manager.get_forward_args()).mean()
-+                            nll = model(batch.inputs, batch.targets, batch.cum_seqlens, ngram_table.slots(pull, batch.ngram_ids),
-+                                        training_manager.get_forward_args())
-+                            vl += (nll if stream_rows is None else stream_memory.mix(nll, stream_rows[s])).mean()
++                            forward = lambda: model(batch.inputs, batch.targets, batch.cum_seqlens,
++                                                    ngram_table.slots(pull, batch.ngram_ids), training_manager.get_forward_args())
++                            vl += (forward() if stream_rows is None else
++                                   stream_eval.evaluate(s, batch, forward, uncompiled_model)[1]).mean()
                      vl = vl / val_steps
                      dist.reduce(vl, 0, op=dist.ReduceOp.AVG)
                      print0(f"step:{step}/{training_schedule.total_steps} val_loss@copyL{blk}:{vl:.4f}", console=True)
-@@ -471,6 +497,12 @@ def main():
+@@ -471,6 +511,12 @@ def main():
              del val_batches, val_pulls
              dist.reduce(val_loss, 0, op=dist.ReduceOp.AVG)
              print0(f"step:{step}/{training_schedule.total_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
@@ -177,18 +243,19 @@ index 39705f9..6f985b6 100644
              if getattr(model, "cplm", False):  # CPLM diagnostics (token-averaged over all ranks)
                  d = model.cplm_diag.clone(); dist.all_reduce(d)
                  n = d[0].clamp_min(1)
-@@ -484,6 +516,16 @@ def main():
+@@ -484,6 +530,17 @@ def main():
              t0 = time.perf_counter()
  
          if last_step:
-+            if memory is not None and memory.fit_path:  # STREAM_RETRIEVAL_FIT: dev only, untimed
++            if memory is not None and memory.fit_path:  # STREAM_RETRIEVAL_FIT: dev runs only, untimed
++                # The helper's rows of the run's own last batches (against the memory before them) and the model's
++                # outputs there, for tools/stream_retrieval/fit_gate_v2.py.
 +                model.eval()
-+                with torch.no_grad():
-+                    stream_memory.fit_dump(memory, batches.loader, lambda b: model(
-+                        b.inputs, b.targets, b.cum_seqlens, ngram_table.load_eval_batch(b.ngram_ids),
-+                        training_manager.get_forward_args()), val_tokens_per_rank, batch_staging, env.rank, print0)
++                stream_memory.fit_dump(memory, lambda b: model(b.inputs, b.targets, b.cum_seqlens,
++                                                               ngram_table.load_eval_batch(b.ngram_ids),
++                                                               training_manager.get_forward_args()),
++                                       uncompiled_model, val_tokens_per_rank, batch_staging, print0)
 +                model.train()
-+                batches.close()
 +            if memory is not None:
 +                memory.close()
              # The checkpoint has no n-gram table: it is sharded across ranks and this saves rank 0 only.
